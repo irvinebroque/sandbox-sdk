@@ -1,0 +1,49 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "sandbox-volume-snapshot-example",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-05-06",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+	// R2 bucket for storing volume snapshots
+	// Create with: npx wrangler r2 bucket create sandbox-snapshots
+	"r2_buckets": [
+		{
+			"binding": "SNAPSHOTS",
+			"bucket_name": "sandbox-snapshots"
+		},
+		{
+			"bucket_name": "sandbox-snapshots",
+			"binding": "sandbox_snapshots",
+			"remote": true
+		}
+	],
+	"containers": [
+		{
+			"class_name": "Sandbox",
+			"image": "./Dockerfile",
+			"instance_type": "basic",
+			"max_instances": 1
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "Sandbox",
+				"name": "Sandbox"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"new_sqlite_classes": [
+				"Sandbox"
+			],
+			"tag": "v1"
+		}
+	]
+}

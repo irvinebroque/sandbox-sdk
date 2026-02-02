@@ -1,0 +1,25 @@
+{
+  "name": "@cloudflare/sandbox-volume-snapshot-example",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Example demonstrating volume snapshots to persist git repos and npm dependencies",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/sandbox": "*",
+    "@cloudflare/workers-types": "^4.20250630.0",
+    "@aws-sdk/client-s3": "^3.782.0",
+    "@aws-sdk/s3-request-presigner": "^3.782.0",
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.59.3"
+  },
+  "author": "",
+  "license": "MIT"
+}

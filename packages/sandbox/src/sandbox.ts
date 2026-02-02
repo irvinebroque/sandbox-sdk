@@ -71,6 +71,7 @@ import {
   S3FSMountError
 } from './storage-mount/errors';
 import type { MountInfo } from './storage-mount/types';
+import { generateSignedCacheUrl } from './utils/cache-signing';
 import { SDK_VERSION } from './version';
 
 export function getSandbox<T extends Sandbox<any>>(
@@ -2840,6 +2841,181 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   }
 
   /**
+   * Restore a snapshot using the CDN cache
+   *
+   * Convenience method that generates a signed cache URL internally.
+   * Requires cacheCustomDomain and HMAC secret to be configured.
+   *
+   * The HMAC secret is resolved in this order:
+   * 1. options.hmacSecret (per-request override)
+   * 2. SNAPSHOT_CACHE_HMAC_SECRET environment variable
+   * 3. config.cacheHmacSecret (config fallback)
+   *
+   * @param snapshotId - Optional specific snapshot ID (uses latest if not specified)
+   * @param options - Optional restore options
+   * @returns Restore result
+   * @throws Error if cache is not configured or HMAC secret is not available
+   */
+  async restoreSnapshotFromCache(
+    snapshotId?: string,
+    options?: RestoreOptions
+  ): Promise<RestoreResult> {
+    const config = await this.getSnapshotConfig();
+    if (!config) {
+      throw new Error(
+        'Snapshots not configured. Call configureSnapshots() first.'
+      );
+    }
+
+    // Get snapshot metadata
+    let metadata: SnapshotMetadata | undefined;
+    if (snapshotId) {
+      metadata = await this.ctx.storage.get<SnapshotMetadata>(
+        `snapshot:meta:${snapshotId}`
+      );
+    } else {
+      // Get latest snapshot
+      const snapshots = await this.listSnapshots();
+      if (snapshots.length === 0) {
+        throw new Error('No snapshots available to restore');
+      }
+      metadata = snapshots.sort((a, b) => b.createdAt - a.createdAt)[0];
+    }
+
+    if (!metadata) {
+      throw new Error(`Snapshot not found: ${snapshotId}`);
+    }
+
+    // Check if we should bypass cache
+    if (options?.bypassCache) {
+      throw new Error(
+        'bypassCache is set but restoreSnapshotFromCache requires cache. ' +
+          'Use restoreSnapshot(downloadUrl) with a presigned URL instead.'
+      );
+    }
+
+    // Check if cache is properly configured
+    if (!this.shouldUseCachedUrl(config, metadata, options)) {
+      throw new Error(
+        'Cache not configured. Set cacheCustomDomain in snapshot config ' +
+          'and provide HMAC secret via env var, config, or options.'
+      );
+    }
+
+    // Get HMAC secret
+    const secret = this.getCacheHmacSecret(config, options);
+    if (!secret) {
+      throw new Error(
+        'HMAC secret not available. Provide via SNAPSHOT_CACHE_HMAC_SECRET env var, ' +
+          'config.cacheHmacSecret, or options.hmacSecret.'
+      );
+    }
+
+    // Generate signed cache URL
+    const downloadUrl = await this.generateCachedDownloadUrl(
+      metadata,
+      config,
+      secret
+    );
+
+    this.logger.debug('Using cached download URL for restore', {
+      snapshotId: metadata.id,
+      domain: config.cacheCustomDomain
+    });
+
+    // Delegate to standard restore with the cached URL
+    return this.restoreSnapshot(downloadUrl, metadata.id, options);
+  }
+
+  /**
+   * Get HMAC secret with priority: options → env → config
+   */
+  private getCacheHmacSecret(
+    config: SnapshotConfig,
+    options?: RestoreOptions
+  ): string | undefined {
+    // 1. Per-request override (highest priority)
+    if (options?.hmacSecret) {
+      return options.hmacSecret;
+    }
+
+    // 2. Environment variable
+    const envObj = this.env as Record<string, unknown>;
+    const envSecret = getEnvString(envObj, 'SNAPSHOT_CACHE_HMAC_SECRET');
+    if (envSecret) {
+      return envSecret;
+    }
+
+    // 3. Config fallback (lowest priority)
+    return config.cacheHmacSecret;
+  }
+
+  /**
+   * Check if cached URL should be used for this restore
+   */
+  private shouldUseCachedUrl(
+    config: SnapshotConfig,
+    metadata: SnapshotMetadata,
+    options?: RestoreOptions
+  ): boolean {
+    // Cache disabled if no custom domain configured
+    if (!config.cacheCustomDomain) {
+      return false;
+    }
+
+    // Check if bypass is requested
+    if (options?.bypassCache) {
+      return false;
+    }
+
+    // Check size limit (default 512 MB)
+    const sizeLimit = config.cacheSizeLimit ?? 536870912;
+    if (metadata.sizeBytes > sizeLimit) {
+      this.logger.debug('Snapshot exceeds cache size limit', {
+        snapshotId: metadata.id,
+        sizeBytes: metadata.sizeBytes,
+        limit: sizeLimit
+      });
+      return false;
+    }
+
+    // Check if HMAC secret is available
+    const secret = this.getCacheHmacSecret(config, options);
+    if (!secret) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Generate a signed URL for downloading a snapshot via cache
+   */
+  private async generateCachedDownloadUrl(
+    metadata: SnapshotMetadata,
+    config: SnapshotConfig,
+    secret: string
+  ): Promise<string> {
+    if (!config.cacheCustomDomain) {
+      throw new Error('cacheCustomDomain is required for cached downloads');
+    }
+
+    // TTL defaults to 1 hour
+    const ttlSeconds = config.cacheUrlTtl ?? 3600;
+
+    // Build path from R2 key
+    // R2 key format: snapshots/{sandboxId}/{snapshotId}.tar.zst
+    const path = `/${metadata.r2Key}`;
+
+    return generateSignedCacheUrl(
+      config.cacheCustomDomain,
+      path,
+      secret,
+      ttlSeconds
+    );
+  }
+
+  /**
    * List all snapshots for this sandbox
    *
    * @returns Array of snapshot metadata
@@ -2924,6 +3100,37 @@ export interface SnapshotConfig {
   compressionLevel: 'fast' | 'balanced' | 'max';
   /** Glob patterns for files to exclude */
   excludePatterns: string[];
+
+  // ============================================================================
+  // CDN Cache Configuration (opt-in feature)
+  // ============================================================================
+
+  /**
+   * Custom domain for cached downloads (e.g., "snapshots.example.com")
+   * When configured, enables CDN caching for snapshot restores.
+   * Requires Cloudflare custom domain with tiered cache and WAF rules.
+   */
+  cacheCustomDomain?: string;
+
+  /**
+   * HMAC secret for signing cached URLs
+   * Fallback if SNAPSHOT_CACHE_HMAC_SECRET env var is not set.
+   * The env var takes precedence over this config value.
+   */
+  cacheHmacSecret?: string;
+
+  /**
+   * TTL for signed cache URLs in seconds
+   * @default 3600 (1 hour)
+   */
+  cacheUrlTtl?: number;
+
+  /**
+   * Maximum file size in bytes to use cache
+   * Larger files will fall back to presigned URLs to avoid cache eviction issues.
+   * @default 536870912 (512 MB - matches Free/Pro/Business cache limit)
+   */
+  cacheSizeLimit?: number;
 }
 
 /**
@@ -2944,6 +3151,18 @@ export interface CreateSnapshotOptions {
 export interface RestoreOptions {
   /** How to handle existing files */
   mode?: 'clean' | 'merge';
+
+  /**
+   * Override HMAC secret for this request
+   * Takes highest priority over env var and config
+   */
+  hmacSecret?: string;
+
+  /**
+   * Force cache bypass (use presigned URL even if cache is configured)
+   * Useful for debugging or when cache is temporarily unavailable
+   */
+  bypassCache?: boolean;
 }
 
 /**

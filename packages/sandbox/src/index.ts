@@ -136,3 +136,9 @@ export {
   MissingCredentialsError,
   S3FSMountError
 } from './storage-mount/errors';
+// Export cache signing utilities for snapshot CDN caching
+export {
+  generateSignedCacheUrl,
+  isSignedUrlExpired,
+  parseSignedCacheUrl
+} from './utils/cache-signing';

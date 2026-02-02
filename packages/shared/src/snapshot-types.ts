@@ -108,6 +108,37 @@ export interface SnapshotConfig {
   compressionLevel: 'fast' | 'balanced' | 'max';
   /** Glob patterns for files to exclude */
   excludePatterns: string[];
+
+  // ============================================================================
+  // CDN Cache Configuration (opt-in feature)
+  // ============================================================================
+
+  /**
+   * Custom domain for cached downloads (e.g., "snapshots.example.com")
+   * When configured, enables CDN caching for snapshot restores.
+   * Requires Cloudflare custom domain with tiered cache and WAF rules.
+   */
+  cacheCustomDomain?: string;
+
+  /**
+   * HMAC secret for signing cached URLs
+   * Fallback if SNAPSHOT_CACHE_HMAC_SECRET env var is not set.
+   * The env var takes precedence over this config value.
+   */
+  cacheHmacSecret?: string;
+
+  /**
+   * TTL for signed cache URLs in seconds
+   * @default 3600 (1 hour)
+   */
+  cacheUrlTtl?: number;
+
+  /**
+   * Maximum file size in bytes to use cache
+   * Larger files will fall back to presigned URLs to avoid cache eviction issues.
+   * @default 536870912 (512 MB - matches Free/Pro/Business cache limit)
+   */
+  cacheSizeLimit?: number;
 }
 
 /**
@@ -128,6 +159,18 @@ export interface CreateSnapshotOptions {
 export interface RestoreOptions {
   /** How to handle existing files */
   mode?: 'clean' | 'merge';
+
+  /**
+   * Override HMAC secret for this request
+   * Takes highest priority over env var and config
+   */
+  hmacSecret?: string;
+
+  /**
+   * Force cache bypass (use presigned URL even if cache is configured)
+   * Useful for debugging or when cache is temporarily unavailable
+   */
+  bypassCache?: boolean;
 }
 
 /**

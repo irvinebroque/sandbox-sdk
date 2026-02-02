@@ -61,13 +61,16 @@ export type {
   FileEntry,
   GetManifestRequest,
   GetManifestResponse,
+  R2CredentialConfig,
   RestoreOptions,
   RestoreResult,
   RestoreSnapshotRequest,
   RestoreSnapshotResponse,
   SnapshotConfig,
   SnapshotManifest,
-  SnapshotMetadata
+  SnapshotMetadata,
+  SnapshotPhase,
+  SnapshotProgressEvent
 } from './snapshot-types.js';
 // Export all types from types.ts
 export type {

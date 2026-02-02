@@ -39,6 +39,18 @@ export {
 // Client types and interfaces
 // =============================================================================
 
+// Snapshot client types (re-exported from @repo/shared for convenience)
+export type {
+  CreateSnapshotRequest,
+  CreateSnapshotResponse,
+  DownloadSpec,
+  FileEntry as SnapshotFileEntry,
+  GetManifestRequest,
+  GetManifestResponse,
+  RestoreSnapshotRequest,
+  RestoreSnapshotResponse,
+  SnapshotManifest
+} from '@repo/shared';
 // Command client types
 export type { ExecuteRequest, ExecuteResponse } from './command-client';
 // File client types
@@ -70,18 +82,6 @@ export type {
   ProcessStartResult,
   StartProcessRequest
 } from './process-client';
-// Snapshot client types
-export type {
-  CreateSnapshotRequest,
-  CreateSnapshotResponse,
-  DownloadSpec,
-  FileEntry as SnapshotFileEntry,
-  GetManifestRequest,
-  GetManifestResponse,
-  RestoreSnapshotRequest,
-  RestoreSnapshotResponse,
-  SnapshotManifest
-} from './snapshot-client';
 // Core types
 export type {
   BaseApiResponse,

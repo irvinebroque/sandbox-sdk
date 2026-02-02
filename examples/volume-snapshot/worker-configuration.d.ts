@@ -43,9 +43,33 @@ declare module '@cloudflare/sandbox' {
     };
   }
 
+  type SnapshotPhase =
+    | 'validating'
+    | 'scanning'
+    | 'compressing'
+    | 'uploading'
+    | 'complete'
+    | 'error';
+
+  interface SnapshotProgressEvent {
+    type: 'phase' | 'complete' | 'error';
+    phase: SnapshotPhase;
+    message: string;
+    stats?: {
+      totalFiles?: number;
+      totalBytes?: number;
+      compressedBytes?: number;
+      duration?: number;
+    };
+    error?: string;
+  }
+
   interface Sandbox {
     configureSnapshots(config: SnapshotConfig): Promise<void>;
     createSnapshot(uploadUrl: string): Promise<CreateSnapshotResponse>;
+    createSnapshotStream(
+      uploadUrl: string
+    ): AsyncGenerator<SnapshotProgressEvent, void, void>;
     restoreSnapshot(downloadUrl: string, snapshotId: string): Promise<RestoreResult>;
   }
 }

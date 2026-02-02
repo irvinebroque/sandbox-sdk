@@ -5,159 +5,37 @@
  * compressed with zstd. No FUSE required - direct shell operations.
  */
 
-import type { Logger } from '@repo/shared';
+import type {
+  CreateSnapshotRequest,
+  CreateSnapshotResponse,
+  FileEntry,
+  GetManifestRequest,
+  GetManifestResponse,
+  Logger,
+  RestoreSnapshotRequest,
+  RestoreSnapshotResponse,
+  SnapshotManifest,
+  SnapshotPhase,
+  SnapshotProgressEvent
+} from '@repo/shared';
 import { shellEscape } from '@repo/shared';
 import type { SessionManager } from './session-manager';
 
-/**
- * Entry describing a single file in a snapshot
- */
-interface FileEntry {
-  /** Relative path from volume root */
-  path: string;
-  /** Unix file mode (permissions) */
-  mode: number;
-  /** File size in bytes */
-  size: number;
-  /** Modification time as Unix timestamp */
-  mtime: number;
-  /** SHA-256 hash of file content */
-  hash: string;
-  /** Type of filesystem entry */
-  type: 'file' | 'directory' | 'symlink';
-  /** Target path for symlinks */
-  symlinkTarget?: string;
-}
+// Re-export types for handler imports
+export type {
+  CreateSnapshotRequest,
+  CreateSnapshotResponse,
+  GetManifestRequest,
+  GetManifestResponse,
+  RestoreSnapshotRequest,
+  RestoreSnapshotResponse
+};
 
 /**
- * Manifest describing files in a snapshot
+ * Security service interface for path validation
  */
-interface SnapshotManifest {
-  /** Manifest format version */
-  version: 1;
-  /** ID of the snapshot this manifest belongs to */
-  snapshotId: string;
-  /** ID of base snapshot (for incremental) */
-  baseSnapshotId?: string;
-  /** List of files in the snapshot */
-  files: FileEntry[];
-  /** Paths deleted since base snapshot (for incremental) */
-  deletedPaths: string[];
-}
-
-/**
- * Request to create a snapshot in the container
- */
-export interface CreateSnapshotRequest {
-  /** Unique ID for this snapshot */
-  snapshotId: string;
-  /** Path to snapshot */
-  volumePath: string;
-  /** Presigned URL to upload archive to R2 */
-  uploadUrl: string;
-  /** Zstd compression level (1-19) */
-  compressionLevel: number;
-  /** Glob patterns for files to exclude */
-  excludePatterns: string[];
-  /** Previous manifest for incremental snapshots */
-  previousManifest?: SnapshotManifest;
-  /** Operation timeout in milliseconds */
-  timeout?: number;
-}
-
-/**
- * Response from snapshot creation
- */
-export interface CreateSnapshotResponse {
-  /** Whether creation succeeded */
-  success: boolean;
-  /** Manifest of files in snapshot */
-  manifest?: SnapshotManifest;
-  /** SHA-256 hash of archive content */
-  contentHash?: string;
-  /** Statistics from creation */
-  stats?: {
-    totalFiles: number;
-    totalBytes: number;
-    compressedBytes: number;
-    duration: number;
-    skippedFiles: number;
-    unchangedFiles: number;
-  };
-  /** Error message if failed */
-  error?: string;
-}
-
-/**
- * Specification for a snapshot to download
- */
-interface DownloadSpec {
-  /** ID of the snapshot */
-  snapshotId: string;
-  /** Presigned URL to download from R2 */
-  url: string;
-  /** Manifest for validation */
-  manifest: SnapshotManifest;
-  /** Expected SHA-256 hash for verification */
-  expectedHash?: string;
-}
-
-/**
- * Request to restore a snapshot in the container
- */
-export interface RestoreSnapshotRequest {
-  /** Path to restore to */
-  volumePath: string;
-  /** Snapshots to download and apply (in order) */
-  downloads: DownloadSpec[];
-  /** How to handle existing files: 'clean' removes all, 'merge' keeps unmodified */
-  mode: 'clean' | 'merge';
-  /** Operation timeout in milliseconds */
-  timeout?: number;
-}
-
-/**
- * Response from snapshot restore
- */
-export interface RestoreSnapshotResponse {
-  /** Whether restore succeeded */
-  success: boolean;
-  /** Statistics from restore */
-  stats?: {
-    filesRestored: number;
-    bytesDownloaded: number;
-    bytesExtracted: number;
-    duration: number;
-    snapshotsApplied: number;
-  };
-  /** Error message if failed */
-  error?: string;
-}
-
-/**
- * Request to get current filesystem manifest
- */
-export interface GetManifestRequest {
-  /** Path to scan */
-  volumePath: string;
-  /** Glob patterns for files to exclude */
-  excludePatterns: string[];
-}
-
-/**
- * Response with filesystem manifest
- */
-export interface GetManifestResponse {
-  /** Whether operation succeeded */
-  success: boolean;
-  /** List of files found */
-  files?: FileEntry[];
-  /** Total size of all files */
-  totalSize?: number;
-  /** Number of files found */
-  fileCount?: number;
-  /** Error message if failed */
-  error?: string;
+export interface SecurityService {
+  validatePath(path: string): { isValid: boolean; errors: string[] };
 }
 
 /**
@@ -188,8 +66,42 @@ const SNAPSHOT_SESSION_ID = '__snapshot__';
 export class SnapshotService {
   constructor(
     private sessionManager: SessionManager,
+    private security: SecurityService,
     private logger: Logger
   ) {}
+
+  /**
+   * Build optimized zstd arguments based on compression level
+   *
+   * For fast compression (level <= 6):
+   *   --fast=1: Speed-optimized mode
+   *   --exclude-compressed: Skip re-compressing already compressed files
+   *   -T4: Use 4 threads for parallel compression
+   *
+   * For higher compression (level > 6):
+   *   -<level>: Use specified compression level
+   *   --exclude-compressed: Skip re-compressing already compressed files
+   *   -T4: Use 4 threads
+   */
+  private buildZstdArgs(level: number): string {
+    const args: string[] = [];
+
+    if (level <= 6) {
+      // Speed-optimized mode for fast compression
+      args.push('--fast=1');
+    } else {
+      // Use explicit compression level for higher compression
+      args.push(`-${level}`);
+    }
+
+    // Always skip re-compressing already compressed files (e.g., .gz, .zip, .jpg)
+    args.push('--exclude-compressed');
+
+    // Use 4 threads for parallel compression
+    args.push('-T4');
+
+    return args.join(' ');
+  }
 
   /**
    * Create a snapshot of a volume path and upload to R2
@@ -214,6 +126,15 @@ export class SnapshotService {
       volumePath,
       compressionLevel
     });
+
+    // Validate volume path for security
+    const pathValidation = this.security.validatePath(volumePath);
+    if (!pathValidation.isValid) {
+      return {
+        success: false,
+        error: `Invalid volume path: ${pathValidation.errors.join(', ')}`
+      };
+    }
 
     try {
       // 1. Validate volume path exists
@@ -260,9 +181,11 @@ export class SnapshotService {
       const fileList = files.map((f: FileEntry) => f.path).join('\n');
 
       // Write file list using session
+      // Use a random delimiter to prevent command injection if a filename contains the delimiter
+      const delimiter = `SNAPSHOT_EOF_${crypto.randomUUID().replace(/-/g, '')}`;
       const writeResult = await this.sessionManager.executeInSession(
         SNAPSHOT_SESSION_ID,
-        `cat > ${shellEscape(fileListPath)} << 'SNAPSHOT_EOF'\n${fileList}\nSNAPSHOT_EOF`,
+        `cat > ${shellEscape(fileListPath)} << '${delimiter}'\n${fileList}\n${delimiter}`,
         volumePath,
         timeout
       );
@@ -286,8 +209,13 @@ export class SnapshotService {
       const archivePath = `/tmp/snapshot-${snapshotId}.tar.zst`;
       const zstdLevel = getZstdLevel(compressionLevel);
 
+      // Build optimized zstd command
+      // --fast=1: Speed-optimized compression (when compressionLevel <= 6)
+      // --exclude-compressed: Skip re-compressing already compressed files
+      // -T4: Use 4 threads for parallel compression
+      const zstdArgs = this.buildZstdArgs(zstdLevel);
       const tarCommand =
-        `tar --create --zstd --options zstd:compression-level=${zstdLevel} ` +
+        `tar -I ${shellEscape(`zstd ${zstdArgs}`)} --create ` +
         `--directory=${shellEscape(volumePath)} ` +
         `--files-from=${shellEscape(fileListPath)} ` +
         `-f ${shellEscape(archivePath)} 2>&1`;
@@ -443,6 +371,15 @@ export class SnapshotService {
       snapshotCount: downloads.length
     });
 
+    // Validate volume path for security
+    const pathValidation = this.security.validatePath(volumePath);
+    if (!pathValidation.isValid) {
+      return {
+        success: false,
+        error: `Invalid volume path: ${pathValidation.errors.join(', ')}`
+      };
+    }
+
     try {
       // 1. Prepare volume path
       if (mode === 'clean') {
@@ -480,8 +417,6 @@ export class SnapshotService {
       }
 
       let totalFilesRestored = 0;
-      const totalBytesDownloaded = 0;
-      const totalBytesExtracted = 0;
 
       // 2. Download and extract each snapshot in order
       for (const download of downloads) {
@@ -542,8 +477,8 @@ export class SnapshotService {
         success: true,
         stats: {
           filesRestored: totalFilesRestored,
-          bytesDownloaded: totalBytesDownloaded,
-          bytesExtracted: totalBytesExtracted,
+          bytesDownloaded: 0, // Not tracked in streaming pipeline
+          bytesExtracted: 0, // Not tracked in streaming pipeline
           duration,
           snapshotsApplied: downloads.length
         }
@@ -569,6 +504,15 @@ export class SnapshotService {
     const { volumePath, excludePatterns } = request;
 
     this.logger.debug('Getting manifest', { volumePath, excludePatterns });
+
+    // Validate volume path for security
+    const pathValidation = this.security.validatePath(volumePath);
+    if (!pathValidation.isValid) {
+      return {
+        success: false,
+        error: `Invalid volume path: ${pathValidation.errors.join(', ')}`
+      };
+    }
 
     try {
       // Build find command with exclude patterns
@@ -718,6 +662,426 @@ export class SnapshotService {
           error: error instanceof Error ? error.message : String(error)
         });
       }
+    }
+  }
+
+  /**
+   * Create a snapshot with streaming progress events
+   *
+   * Same logic as createSnapshot() but yields progress events at each phase.
+   */
+  async *createSnapshotStream(
+    request: CreateSnapshotRequest
+  ): AsyncGenerator<SnapshotProgressEvent, CreateSnapshotResponse, void> {
+    const startTime = Date.now();
+    const {
+      snapshotId,
+      volumePath,
+      uploadUrl,
+      compressionLevel,
+      excludePatterns,
+      timeout
+    } = request;
+
+    this.logger.info('Creating snapshot (streaming)', {
+      snapshotId,
+      volumePath,
+      compressionLevel
+    });
+
+    // Validate volume path for security (before defining helper to fail fast)
+    const pathValidation = this.security.validatePath(volumePath);
+    if (!pathValidation.isValid) {
+      const errorMsg = `Invalid volume path: ${pathValidation.errors.join(', ')}`;
+      yield {
+        type: 'error',
+        phase: 'error',
+        message: errorMsg,
+        error: errorMsg
+      } as SnapshotProgressEvent;
+      return {
+        success: false,
+        error: errorMsg
+      };
+    }
+
+    const createProgressEvent = (
+      type: 'phase' | 'complete' | 'error',
+      phase: SnapshotPhase,
+      message: string,
+      stats?: SnapshotProgressEvent['stats'],
+      error?: string
+    ): SnapshotProgressEvent => ({
+      type,
+      phase,
+      message,
+      stats,
+      error
+    });
+
+    try {
+      // 1. Validating phase - check volume path exists
+      yield createProgressEvent(
+        'phase',
+        'validating',
+        `Validating volume path: ${volumePath}`
+      );
+
+      const existsResult = await this.sessionManager.executeInSession(
+        SNAPSHOT_SESSION_ID,
+        `test -d ${shellEscape(volumePath)} && echo "exists"`,
+        volumePath,
+        timeout
+      );
+
+      if (!existsResult.success) {
+        const errorMsg = `Failed to check volume path: ${existsResult.error?.message || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      if (!existsResult.data.stdout.includes('exists')) {
+        const errorMsg = `Volume path does not exist: ${volumePath}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      // 2. Scanning phase - get manifest of files
+      yield createProgressEvent(
+        'phase',
+        'scanning',
+        'Scanning files for snapshot...'
+      );
+
+      const manifestResult = await this.getManifest({
+        volumePath,
+        excludePatterns
+      });
+
+      if (!manifestResult.success || !manifestResult.files) {
+        const errorMsg = manifestResult.error || 'Failed to get file manifest';
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      const files = manifestResult.files;
+      const fileCount = files.length;
+      const totalBytes = manifestResult.totalSize || 0;
+
+      yield createProgressEvent(
+        'phase',
+        'scanning',
+        `Found ${fileCount} files (${totalBytes} bytes)`,
+        { totalFiles: fileCount, totalBytes }
+      );
+
+      // 3. Compressing phase - create tar archive
+      yield createProgressEvent(
+        'phase',
+        'compressing',
+        'Creating compressed archive...',
+        { totalFiles: fileCount, totalBytes }
+      );
+
+      // Create file list for tar
+      const fileListPath = `/tmp/snapshot-${snapshotId}-files.txt`;
+      const fileList = files.map((f: FileEntry) => f.path).join('\n');
+
+      // Use a random delimiter to prevent command injection if a filename contains the delimiter
+      const delimiter = `SNAPSHOT_EOF_${crypto.randomUUID().replace(/-/g, '')}`;
+      const writeResult = await this.sessionManager.executeInSession(
+        SNAPSHOT_SESSION_ID,
+        `cat > ${shellEscape(fileListPath)} << '${delimiter}'\n${fileList}\n${delimiter}`,
+        volumePath,
+        timeout
+      );
+
+      if (!writeResult.success) {
+        const errorMsg = `Failed to write file list: ${writeResult.error?.message || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      if (writeResult.data.exitCode !== 0) {
+        const errorMsg = `Failed to write file list: ${writeResult.data.stderr || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      // Create tar archive with optimized zstd compression
+      const archivePath = `/tmp/snapshot-${snapshotId}.tar.zst`;
+      const zstdLevel = getZstdLevel(compressionLevel);
+
+      // Build optimized zstd command (same as in createSnapshot)
+      const zstdArgs = this.buildZstdArgs(zstdLevel);
+      const tarCommand =
+        `tar -I ${shellEscape(`zstd ${zstdArgs}`)} --create ` +
+        `--directory=${shellEscape(volumePath)} ` +
+        `--files-from=${shellEscape(fileListPath)} ` +
+        `-f ${shellEscape(archivePath)} 2>&1`;
+
+      const tarResult = await this.sessionManager.executeInSession(
+        SNAPSHOT_SESSION_ID,
+        tarCommand,
+        volumePath,
+        timeout
+      );
+
+      if (!tarResult.success) {
+        await this.cleanupTempFiles([fileListPath, archivePath]);
+        const errorMsg = `Failed to create tar archive: ${tarResult.error?.message || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      if (tarResult.data.exitCode !== 0) {
+        await this.cleanupTempFiles([fileListPath, archivePath]);
+        const errorMsg = `Failed to create tar archive: ${tarResult.data.stderr || tarResult.data.stdout || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      // Get archive size and hash
+      const statResult = await this.sessionManager.executeInSession(
+        SNAPSHOT_SESSION_ID,
+        `stat -c '%s' ${shellEscape(archivePath)} && sha256sum ${shellEscape(archivePath)} | cut -d' ' -f1`,
+        volumePath,
+        timeout
+      );
+
+      if (!statResult.success) {
+        await this.cleanupTempFiles([fileListPath, archivePath]);
+        const errorMsg = `Failed to get archive stats: ${statResult.error?.message || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      if (statResult.data.exitCode !== 0) {
+        await this.cleanupTempFiles([fileListPath, archivePath]);
+        const errorMsg = `Failed to get archive stats: ${statResult.data.stderr || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      const [sizeStr, contentHash] = statResult.data.stdout.trim().split('\n');
+      const compressedBytes = parseInt(sizeStr, 10);
+
+      yield createProgressEvent(
+        'phase',
+        'compressing',
+        `Compression complete: ${compressedBytes} bytes`,
+        { totalFiles: fileCount, totalBytes, compressedBytes }
+      );
+
+      // 4. Uploading phase - upload to R2
+      yield createProgressEvent(
+        'phase',
+        'uploading',
+        'Uploading to storage...',
+        { totalFiles: fileCount, totalBytes, compressedBytes }
+      );
+
+      const uploadCommand =
+        `curl -s -X PUT -H "Content-Type: application/zstd" ` +
+        `--data-binary @${shellEscape(archivePath)} ` +
+        `${shellEscape(uploadUrl)} -w "%{http_code}"`;
+
+      const uploadResult = await this.sessionManager.executeInSession(
+        SNAPSHOT_SESSION_ID,
+        uploadCommand,
+        volumePath,
+        timeout
+      );
+
+      // Cleanup temp files
+      await this.cleanupTempFiles([fileListPath, archivePath]);
+
+      if (!uploadResult.success) {
+        const errorMsg = `Failed to upload archive: ${uploadResult.error?.message || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      if (uploadResult.data.exitCode !== 0) {
+        const errorMsg = `Failed to upload archive: ${uploadResult.data.stderr || 'Unknown error'}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      // Check HTTP status code
+      const httpStatus = uploadResult.data.stdout.trim().slice(-3);
+      if (!httpStatus.startsWith('2')) {
+        const errorMsg = `Upload failed with HTTP status ${httpStatus}`;
+        yield createProgressEvent(
+          'error',
+          'error',
+          errorMsg,
+          undefined,
+          errorMsg
+        );
+        return {
+          success: false,
+          error: errorMsg
+        };
+      }
+
+      const duration = Date.now() - startTime;
+
+      // 5. Complete phase - build manifest and return
+      const manifest: SnapshotManifest = {
+        version: 1,
+        snapshotId,
+        files,
+        deletedPaths: []
+      };
+
+      this.logger.info('Snapshot created successfully (streaming)', {
+        snapshotId,
+        fileCount,
+        totalBytes,
+        compressedBytes,
+        duration
+      });
+
+      yield createProgressEvent(
+        'complete',
+        'complete',
+        'Snapshot created successfully',
+        { totalFiles: fileCount, totalBytes, compressedBytes, duration }
+      );
+
+      return {
+        success: true,
+        manifest,
+        contentHash,
+        stats: {
+          totalFiles: fileCount,
+          totalBytes,
+          compressedBytes,
+          duration,
+          skippedFiles: 0,
+          unchangedFiles: 0
+        }
+      };
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.logger.error(
+        'Snapshot creation failed (streaming)',
+        error instanceof Error ? error : undefined,
+        { snapshotId, volumePath }
+      );
+
+      yield createProgressEvent(
+        'error',
+        'error',
+        `Snapshot creation failed: ${errorMsg}`,
+        { duration: Date.now() - startTime },
+        errorMsg
+      );
+
+      return {
+        success: false,
+        error: `Snapshot creation failed: ${errorMsg}`
+      };
     }
   }
 }

@@ -49,6 +49,9 @@ export type {
   RunCodeOptions,
   SandboxOptions,
   SessionOptions,
+  // Snapshot streaming types
+  SnapshotPhase,
+  SnapshotProgressEvent,
   StreamOptions,
   // Process readiness types
   WaitForLogResult,
@@ -136,6 +139,12 @@ export {
   MissingCredentialsError,
   S3FSMountError
 } from './storage-mount/errors';
+// Export content-addressed cache key utilities
+export {
+  generateCacheKey,
+  generateLockfileCacheKey,
+  generatePrefixedCacheKey
+} from './utils/cache-keys';
 // Export cache signing utilities for snapshot CDN caching
 export {
   generateSignedCacheUrl,

@@ -285,6 +285,14 @@ export function setupRoutes(router: Router, container: Container): void {
 
   router.register({
     method: 'POST',
+    path: '/api/snapshot/create/stream',
+    handler: async (req, ctx) =>
+      container.get('snapshotHandler').handle(req, ctx),
+    middleware: [container.get('loggingMiddleware')]
+  });
+
+  router.register({
+    method: 'POST',
     path: '/api/snapshot/restore',
     handler: async (req, ctx) =>
       container.get('snapshotHandler').handle(req, ctx),

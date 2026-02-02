@@ -13,14 +13,15 @@ import { CorsMiddleware } from '../middleware/cors';
 import { LoggingMiddleware } from '../middleware/logging';
 import { SecurityServiceAdapter } from '../security/security-adapter';
 import { SecurityService } from '../security/security-service';
-import { FileService } from '../services/file-service';
-import { GitService } from '../services/git-service';
-import { InterpreterService } from '../services/interpreter-service';
-import { InMemoryPortStore, PortService } from '../services/port-service';
-import { ProcessService } from '../services/process-service';
-import { ProcessStore } from '../services/process-store';
-import { SessionManager } from '../services/session-manager';
-import { SnapshotService } from '../services/snapshot-service';
+import { FileService } from '../services/file-service.js';
+import { GitService } from '../services/git-service.js';
+import { InterpreterService } from '../services/interpreter-service.js';
+import { InMemoryPortStore, PortService } from '../services/port-service.js';
+import { ProcessService } from '../services/process-service.js';
+import { ProcessStore } from '../services/process-store.js';
+import { R2UploadService } from '../services/r2-upload-service.js';
+import { SessionManager } from '../services/session-manager.js';
+import { SnapshotService } from '../services/snapshot-service.js';
 
 export interface Dependencies {
   // Services
@@ -30,6 +31,7 @@ export interface Dependencies {
   gitService: GitService;
   interpreterService: InterpreterService;
   snapshotService: SnapshotService;
+  r2UploadService: R2UploadService;
 
   // Infrastructure
   logger: Logger;
@@ -116,7 +118,12 @@ export class Container {
       sessionManager
     );
     const interpreterService = new InterpreterService(logger);
-    const snapshotService = new SnapshotService(sessionManager, logger);
+    const snapshotService = new SnapshotService(
+      sessionManager,
+      securityAdapter,
+      logger
+    );
+    const r2UploadService = new R2UploadService(sessionManager, logger);
 
     // Initialize handlers
     const sessionHandler = new SessionHandler(sessionManager, logger);
@@ -145,6 +152,7 @@ export class Container {
       gitService,
       interpreterService,
       snapshotService,
+      r2UploadService,
 
       // Infrastructure
       logger,

@@ -88,6 +88,25 @@ export interface FileEntry {
 // ============================================================================
 
 /**
+ * Configuration for R2 credentials used by auto-snapshot/restore
+ * Stored separately from SnapshotConfig for security - never exposed in getSnapshotConfig()
+ */
+export interface R2CredentialConfig {
+  /** Cloudflare account ID */
+  accountId: string;
+  /** R2 bucket name */
+  bucketName: string;
+  /** S3 API access key ID */
+  accessKeyId: string;
+  /** S3 API secret access key */
+  secretAccessKey: string;
+  /** Key prefix for snapshots (default: "snapshots/") */
+  keyPrefix?: string;
+  /** Presigned URL expiry in seconds (default: 3600) */
+  urlExpiry?: number;
+}
+
+/**
  * Configuration for snapshot behavior
  * Stored in Durable Object storage
  */
@@ -139,6 +158,25 @@ export interface SnapshotConfig {
    * @default 536870912 (512 MB - matches Free/Pro/Business cache limit)
    */
   cacheSizeLimit?: number;
+
+  // ============================================================================
+  // Content-Addressed Caching (opt-in feature)
+  // ============================================================================
+
+  /**
+   * Enable content-addressed cache keys based on lockfile hashes
+   * When enabled, snapshots are keyed by the hash of lockfile content,
+   * allowing builds with identical dependencies to share snapshots.
+   * @default false
+   */
+  useContentAddressedKeys?: boolean;
+
+  /**
+   * Path to lockfile for content-addressed key generation
+   * If not specified, automatically detects from common lockfile paths:
+   * package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb
+   */
+  lockfilePath?: string;
 }
 
 /**
@@ -306,5 +344,42 @@ export interface GetManifestResponse {
   /** Number of files found */
   fileCount?: number;
   /** Error message if failed */
+  error?: string;
+}
+
+// ============================================================================
+// Streaming Progress Types
+// ============================================================================
+
+/**
+ * Phase of snapshot creation
+ */
+export type SnapshotPhase =
+  | 'validating'
+  | 'scanning'
+  | 'compressing'
+  | 'uploading'
+  | 'complete'
+  | 'error';
+
+/**
+ * Progress event emitted during snapshot creation
+ * Used for streaming progress updates to the client
+ */
+export interface SnapshotProgressEvent {
+  /** Event type */
+  type: 'phase' | 'complete' | 'error';
+  /** Current phase of the operation */
+  phase: SnapshotPhase;
+  /** Human-readable progress message */
+  message: string;
+  /** Statistics available at this point */
+  stats?: {
+    totalFiles?: number;
+    totalBytes?: number;
+    compressedBytes?: number;
+    duration?: number;
+  };
+  /** Error message if type is 'error' */
   error?: string;
 }

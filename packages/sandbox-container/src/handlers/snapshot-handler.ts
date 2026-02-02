@@ -7,18 +7,18 @@
  * - POST /api/snapshot/manifest - Get current filesystem manifest
  */
 
-import type { Logger } from '@repo/shared';
-import { ErrorCode } from '@repo/shared/errors';
-import type { RequestContext } from '../core/types';
 import type {
   CreateSnapshotRequest,
   CreateSnapshotResponse,
   GetManifestRequest,
   GetManifestResponse,
+  Logger,
   RestoreSnapshotRequest,
-  RestoreSnapshotResponse,
-  SnapshotService
-} from '../services/snapshot-service';
+  RestoreSnapshotResponse
+} from '@repo/shared';
+import { ErrorCode } from '@repo/shared/errors';
+import type { RequestContext } from '../core/types';
+import type { SnapshotService } from '../services/snapshot-service';
 import { BaseHandler } from './base-handler';
 
 export class SnapshotHandler extends BaseHandler<Request, Response> {
@@ -36,6 +36,8 @@ export class SnapshotHandler extends BaseHandler<Request, Response> {
     switch (pathname) {
       case '/api/snapshot/create':
         return await this.handleCreate(request, context);
+      case '/api/snapshot/create/stream':
+        return await this.handleCreateStream(request, context);
       case '/api/snapshot/restore':
         return await this.handleRestore(request, context);
       case '/api/snapshot/manifest':
@@ -126,6 +128,132 @@ export class SnapshotHandler extends BaseHandler<Request, Response> {
         {
           message:
             error instanceof Error ? error.message : 'Snapshot creation failed',
+          code: ErrorCode.INTERNAL_ERROR
+        },
+        context
+      );
+    }
+  }
+
+  private async handleCreateStream(
+    request: Request,
+    context: RequestContext
+  ): Promise<Response> {
+    const requestLogger = this.createRequestLogger(
+      request,
+      'snapshot.create.stream'
+    );
+
+    try {
+      const body = await this.parseRequestBody<CreateSnapshotRequest>(request);
+
+      // Validate required fields
+      if (!body.snapshotId) {
+        return this.createErrorResponse(
+          {
+            message: 'snapshotId is required',
+            code: ErrorCode.VALIDATION_FAILED
+          },
+          context
+        );
+      }
+
+      if (!body.volumePath) {
+        return this.createErrorResponse(
+          {
+            message: 'volumePath is required',
+            code: ErrorCode.VALIDATION_FAILED
+          },
+          context
+        );
+      }
+
+      if (!body.uploadUrl) {
+        return this.createErrorResponse(
+          {
+            message: 'uploadUrl is required',
+            code: ErrorCode.VALIDATION_FAILED
+          },
+          context
+        );
+      }
+
+      requestLogger.info('Creating snapshot (streaming)', {
+        snapshotId: body.snapshotId,
+        volumePath: body.volumePath
+      });
+
+      const generator = this.snapshotService.createSnapshotStream(body);
+
+      // Create SSE stream from async generator
+      const stream = new ReadableStream({
+        async start(controller) {
+          const encoder = new TextEncoder();
+
+          try {
+            // Iterate through all progress events
+            // The generator yields SnapshotProgressEvent and returns CreateSnapshotResponse
+            let result = await generator.next();
+            while (!result.done) {
+              const event = result.value;
+              const sseData = `data: ${JSON.stringify(event)}\n\n`;
+              controller.enqueue(encoder.encode(sseData));
+              result = await generator.next();
+            }
+
+            // When done, result.value contains the CreateSnapshotResponse
+            if (result.value) {
+              const finalResponse = result.value;
+              const finalEvent = `data: ${JSON.stringify({
+                type: 'result',
+                response: finalResponse
+              })}\n\n`;
+              controller.enqueue(encoder.encode(finalEvent));
+            }
+
+            controller.close();
+          } catch (error) {
+            const errorEvent = `data: ${JSON.stringify({
+              type: 'error',
+              phase: 'error',
+              message: error instanceof Error ? error.message : 'Unknown error',
+              error: error instanceof Error ? error.message : 'Unknown error'
+            })}\n\n`;
+            controller.enqueue(encoder.encode(errorEvent));
+            controller.close();
+          }
+        },
+        cancel() {
+          // Cleanup the generator when client disconnects
+          // The return value doesn't matter since the stream is being cancelled
+          generator.return({
+            success: false,
+            error: 'Stream cancelled by client'
+          });
+        }
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          ...context.corsHeaders
+        }
+      });
+    } catch (error) {
+      requestLogger.error(
+        'Snapshot creation stream failed',
+        error instanceof Error ? error : undefined
+      );
+
+      return this.createErrorResponse(
+        {
+          message:
+            error instanceof Error
+              ? error.message
+              : 'Snapshot creation stream failed',
           code: ErrorCode.INTERNAL_ERROR
         },
         context

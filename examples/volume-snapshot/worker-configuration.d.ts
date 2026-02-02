@@ -88,6 +88,9 @@ declare global {
     R2_SECRET_ACCESS_KEY: string;
     R2_ENDPOINT: string; // e.g., https://<account-id>.r2.cloudflarestorage.com
     R2_BUCKET_NAME: string; // e.g., sandbox-snapshots
+
+    // Cloudflare account ID (used for auto-snapshot R2 credential configuration)
+    CF_ACCOUNT_ID: string;
   }
 }
 

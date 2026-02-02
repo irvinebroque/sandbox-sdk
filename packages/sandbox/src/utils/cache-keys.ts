@@ -86,7 +86,9 @@ export async function generateLockfileCacheKey(
 
       const cacheKey = await generateCacheKey(result.content);
       return { cacheKey, lockfilePath };
-    } catch {}
+    } catch {
+      // Lockfile doesn't exist or can't be read - continue to next type
+    }
   }
 
   return null;

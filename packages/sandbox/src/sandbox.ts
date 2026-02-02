@@ -84,6 +84,7 @@ import {
   generatePresignedGetUrl,
   generatePresignedPutUrl
 } from './utils/s3-presign';
+import { parseTtl } from './utils/ttl';
 import { SDK_VERSION } from './version';
 
 export function getSandbox<T extends Sandbox<any>>(
@@ -787,8 +788,19 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       );
     });
 
-    // TODO: Auto-restore snapshot on wake if enabled (to be implemented separately)
-    // When implementing, check this.snapshotConfig?.autoRestoreOnWake and restore from R2
+    // Auto-restore snapshot on wake if enabled
+    // Use blockConcurrencyWhile to prevent user requests during restore
+    this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        await this.maybeAutoRestore();
+      } catch (error) {
+        this.logger.error(
+          'Auto-restore failed on wake',
+          error instanceof Error ? error : new Error(String(error))
+        );
+        // Don't re-throw - allow container to start even if restore fails
+      }
+    });
   }
 
   /**
@@ -1046,8 +1058,8 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       );
       // Do nothing - don't call stop(), container stays alive
     } else {
-      // TODO: Auto-snapshot before sleep if enabled (to be implemented separately)
-      // When implementing, check this.snapshotConfig?.autoSnapshotOnSleep and upload to R2
+      // Auto-snapshot before sleep if configured
+      await this.maybeAutoSnapshotWithRetry();
 
       // Default behavior: stop the container
       this.logger.debug('Activity expired - stopping container');
@@ -2838,6 +2850,15 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       tags: options?.tags || {}
     };
 
+    // Compute expiresAt from TTL (per-snapshot TTL takes precedence over config default)
+    const ttlString = options?.ttl ?? config.defaultTtl;
+    if (ttlString) {
+      const ttlMs = parseTtl(ttlString);
+      if (ttlMs !== null) {
+        metadata.expiresAt = Date.now() + ttlMs;
+      }
+    }
+
     // Store metadata (atomic - no separate list to maintain)
     await this.ctx.storage.put(`snapshot:meta:${snapshotId}`, metadata);
 
@@ -3005,6 +3026,15 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       restoreCount: 0,
       tags: options?.tags || {}
     };
+
+    // Compute expiresAt from TTL (per-snapshot TTL takes precedence over config default)
+    const ttlString = options?.ttl ?? config.defaultTtl;
+    if (ttlString) {
+      const ttlMs = parseTtl(ttlString);
+      if (ttlMs !== null) {
+        metadata.expiresAt = Date.now() + ttlMs;
+      }
+    }
 
     // Store metadata (atomic - no separate list to maintain)
     await this.ctx.storage.put(`snapshot:meta:${snapshotId}`, metadata);
@@ -3307,7 +3337,10 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   /**
    * List all snapshots for this sandbox
    *
-   * @returns Array of snapshot metadata
+   * Filters out expired snapshots and performs lazy cleanup of their metadata.
+   * R2 object deletion is handled by R2 lifecycle rules, not here.
+   *
+   * @returns Array of snapshot metadata (excluding expired snapshots)
    */
   async listSnapshots(): Promise<SnapshotMetadata[]> {
     // Use storage.list() with prefix to atomically get all snapshot keys
@@ -3316,11 +3349,30 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       prefix: 'snapshot:meta:'
     });
 
+    const now = Date.now();
     const snapshots: SnapshotMetadata[] = [];
+    const expiredIds: string[] = [];
+
     for (const [, metadata] of entries) {
       if (metadata) {
-        snapshots.push(metadata);
+        // Check if snapshot has expired
+        if (metadata.expiresAt && metadata.expiresAt < now) {
+          expiredIds.push(metadata.id);
+        } else {
+          snapshots.push(metadata);
+        }
       }
+    }
+
+    // Cleanup expired snapshots (metadata only - R2 lifecycle rules handle object deletion)
+    if (expiredIds.length > 0) {
+      for (const id of expiredIds) {
+        await this.deleteSnapshotMetadata(id);
+      }
+      this.logger.info('Cleaned up expired snapshots', {
+        count: expiredIds.length,
+        ids: expiredIds
+      });
     }
 
     return snapshots;
@@ -3335,6 +3387,30 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Simply delete the metadata key - no separate list to maintain
     await this.ctx.storage.delete(`snapshot:meta:${snapshotId}`);
     this.logger.info('Snapshot metadata deleted', { snapshotId });
+  }
+
+  /**
+   * Get metadata for a specific snapshot
+   *
+   * @param snapshotId - ID of snapshot to retrieve
+   * @returns Snapshot metadata or null if not found
+   *
+   * @example
+   * ```typescript
+   * const metadata = await sandbox.getSnapshotMetadata('snap-123');
+   * if (metadata) {
+   *   console.log(`Snapshot size: ${metadata.sizeBytes} bytes`);
+   * }
+   * ```
+   */
+  async getSnapshotMetadata(
+    snapshotId: string
+  ): Promise<SnapshotMetadata | null> {
+    return (
+      (await this.ctx.storage.get<SnapshotMetadata>(
+        `snapshot:meta:${snapshotId}`
+      )) || null
+    );
   }
 
   /**
@@ -3357,6 +3433,142 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
     return this.client.snapshots.getManifest(request);
   }
+
+  // ============================================================================
+  // Private Auto-Snapshot/Restore Methods
+  // ============================================================================
+
+  /**
+   * Get stored R2 credentials (private - never expose to callers)
+   */
+  private async getR2Credentials(): Promise<R2CredentialConfig | null> {
+    return (
+      (await this.ctx.storage.get<R2CredentialConfig>('r2:credentials')) || null
+    );
+  }
+
+  /**
+   * Generate R2 object key for a snapshot
+   */
+  private generateR2Key(creds: R2CredentialConfig, snapshotId: string): string {
+    const prefix = creds.keyPrefix || 'snapshots/';
+    const normalizedPrefix = prefix.endsWith('/') ? prefix : `${prefix}/`;
+    return `${normalizedPrefix}${this.ctx.id}/${snapshotId}.tar.zst`;
+  }
+
+  /**
+   * Auto-restore snapshot on container wake if enabled
+   *
+   * Called from onStart(). Errors are caught and logged by the caller
+   * to avoid blocking container startup.
+   */
+  private async maybeAutoRestore(): Promise<void> {
+    const config = await this.getSnapshotConfig();
+    if (!config?.enabled || !config.autoRestoreOnWake) {
+      return;
+    }
+
+    // Get latest snapshot
+    const snapshots = await this.listSnapshots();
+    if (snapshots.length === 0) {
+      this.logger.debug('No snapshots available for auto-restore');
+      return;
+    }
+
+    const latest = snapshots.sort((a, b) => b.createdAt - a.createdAt)[0];
+    this.logger.info('Auto-restoring snapshot on wake', {
+      snapshotId: latest.id
+    });
+
+    // Prefer CDN cache if configured, otherwise use R2 presigned URL
+    if (this.shouldUseCachedUrl(config, latest)) {
+      await this.restoreSnapshotFromCache(latest.id);
+    } else {
+      const creds = await this.getR2Credentials();
+      if (!creds) {
+        this.logger.warn(
+          'Auto-restore enabled but no R2 credentials or CDN cache configured'
+        );
+        return;
+      }
+
+      const downloadUrl = await generatePresignedGetUrl(creds, latest.r2Key);
+      await this.restoreSnapshot(downloadUrl, latest.id);
+    }
+
+    this.logger.info('Auto-restore completed', { snapshotId: latest.id });
+  }
+
+  /**
+   * Auto-snapshot before container sleep with retry logic
+   *
+   * Called from onActivityExpired(). Retries once on failure, then
+   * proceeds with shutdown regardless to avoid stuck containers.
+   */
+  private async maybeAutoSnapshotWithRetry(): Promise<void> {
+    const config = await this.getSnapshotConfig();
+    if (!config?.enabled || !config.autoSnapshotOnSleep) {
+      return;
+    }
+
+    const creds = await this.getR2Credentials();
+    if (!creds) {
+      this.logger.warn(
+        'Auto-snapshot enabled but no R2 credentials configured - skipping'
+      );
+      return;
+    }
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await this.performAutoSnapshot(config, creds);
+        return; // Success
+      } catch (error) {
+        const errorObj =
+          error instanceof Error ? error : new Error(String(error));
+        if (attempt === 1) {
+          this.logger.warn('Auto-snapshot attempt 1 failed, retrying', {
+            error: errorObj.message
+          });
+        } else {
+          this.logger.error(
+            'Auto-snapshot failed after retry, proceeding with shutdown',
+            errorObj
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Perform the actual auto-snapshot operation
+   */
+  private async performAutoSnapshot(
+    config: SnapshotConfig,
+    creds: R2CredentialConfig
+  ): Promise<void> {
+    const snapshotId = `auto-${Date.now()}`;
+    const r2Key = this.generateR2Key(creds, snapshotId);
+
+    this.logger.info('Creating auto-snapshot before sleep', {
+      snapshotId,
+      r2Key
+    });
+
+    const uploadUrl = await generatePresignedPutUrl(creds, r2Key);
+    const result = await this.createSnapshot(uploadUrl, { snapshotId });
+
+    if (result) {
+      this.logger.info('Auto-snapshot created successfully', {
+        snapshotId: result.id,
+        sizeBytes: result.sizeBytes
+      });
+    } else {
+      this.logger.debug(
+        'Auto-snapshot skipped (content unchanged from last restore)'
+      );
+    }
+  }
 }
 
 // ============================================================================
@@ -3365,6 +3577,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
 export type {
   CreateSnapshotOptions,
+  R2CredentialConfig,
   RestoreOptions,
   RestoreResult,
   SnapshotConfig,

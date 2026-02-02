@@ -1,14 +1,23 @@
 ---
-'@cloudflare/sandbox': patch
+'@cloudflare/sandbox': minor
 ---
 
-Add volume-snapshot example demonstrating how to persist container state across restarts.
+Add volume snapshot support for persisting container state across restarts.
 
-The example shows:
+New methods on Sandbox class:
 
-- Cloning a git repository into the sandbox
-- Installing npm dependencies
-- Creating a snapshot of the workspace to R2
-- Restoring from the snapshot on subsequent sandbox starts
+- `configureSnapshots()` / `getSnapshotConfig()` - Configure snapshot settings
+- `configureR2Credentials()` / `clearR2Credentials()` / `hasR2Credentials()` - Manage R2 credentials
+- `createSnapshot()` / `createSnapshotStream()` - Create snapshots with streaming progress
+- `restoreSnapshot()` / `restoreSnapshotFromCache()` - Restore from R2 or CDN cache
+- `listSnapshots()` / `getSnapshotMetadata()` / `deleteSnapshotMetadata()` - Manage snapshots
 
-This reduces cold start time from minutes (clone + npm install) to seconds (snapshot restore).
+Features:
+
+- Automatic snapshot on sleep / restore on wake
+- CDN caching for faster restores via signed URLs
+- Content-addressed keys for deduplication (skip upload if unchanged)
+- Streaming progress events during snapshot creation
+- Configurable compression levels (fast/balanced/max)
+
+Includes example app demonstrating git clone + npm install persistence.

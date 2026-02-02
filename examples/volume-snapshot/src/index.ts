@@ -136,8 +136,6 @@ function handleSetup(env: Env): Response {
       );
 
       if (existingSnapshot) {
-        await sendStep('Found existing snapshot, restoring...');
-
         // Configure snapshots with auto-restore and content-addressed keys
         await sandbox.configureSnapshots({
           enabled: true,
@@ -150,7 +148,42 @@ function handleSetup(env: Env): Response {
           useContentAddressedKeys: true // Enable skip-if-restored optimization
         });
 
-        // Generate download URL and restore
+        // Configure R2 credentials for auto-snapshot/restore functionality
+        // This allows the sandbox to automatically create/restore snapshots
+        // when the container sleeps/wakes without manual intervention
+        await sandbox.configureR2Credentials({
+          accountId: env.CF_ACCOUNT_ID,
+          bucketName: env.R2_BUCKET_NAME,
+          accessKeyId: env.R2_ACCESS_KEY_ID,
+          secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+          keyPrefix: SNAPSHOT_KEY_PREFIX
+        });
+
+        // Check if project directory already exists (auto-restore may have already run)
+        const checkResult = await sandbox.exec(
+          `test -d ${PROJECT_DIR} && echo "exists"`,
+          { timeout: 5000 }
+        );
+        const alreadyRestored = checkResult.stdout.trim() === 'exists';
+
+        if (alreadyRestored) {
+          // Auto-restore already ran when container woke up - no need to manually restore
+          await sendStep(
+            'Project directory exists (auto-restored on wake) - skipping manual restore'
+          );
+          await sendEvent({
+            type: 'complete',
+            success: true,
+            restored: true,
+            duration: Date.now() - startTime,
+            stats: { filesRestored: 0 } // Auto-restore already handled this
+          });
+          await writer.close();
+          return;
+        }
+
+        // Manual restore needed (e.g., first request after configuring auto-restore)
+        await sendStep('Found existing snapshot, restoring...');
         const downloadUrl = await getDownloadUrl(
           env,
           `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`
@@ -198,6 +231,15 @@ function handleSetup(env: Env): Response {
         autoRestoreOnWake: true,
         autoSnapshotOnSleep: true,
         useContentAddressedKeys: true // Enable skip-if-restored optimization
+      });
+
+      // Configure R2 credentials for auto-snapshot/restore functionality
+      await sandbox.configureR2Credentials({
+        accountId: env.CF_ACCOUNT_ID,
+        bucketName: env.R2_BUCKET_NAME,
+        accessKeyId: env.R2_ACCESS_KEY_ID,
+        secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+        keyPrefix: SNAPSHOT_KEY_PREFIX
       });
       await sendStep('Configured snapshot settings');
 
@@ -360,7 +402,8 @@ async function handleStatus(env: Env): Promise<Response> {
         node_modules: nodeModules.stdout.includes('exists'),
         '.git': gitDir.stdout.includes('exists')
       },
-      nodeModulesPackageCount: parseInt(nodeModulesCount.stdout.trim()) || 0,
+      nodeModulesPackageCount:
+        parseInt(nodeModulesCount.stdout.trim(), 10) || 0,
       snapshotExists: !!snapshotExists,
       snapshotMetadata: metadata
     });
@@ -404,9 +447,8 @@ async function handleCreateSnapshot(env: Env): Promise<Response> {
       });
     }
 
-    if (!result.success) {
-      throw new Error(result.error || 'Snapshot creation failed');
-    }
+    // createSnapshot returns SnapshotMetadata on success, null if skipped, or throws on error
+    // If we reach here, we have valid metadata
 
     // Update metadata
     const metadata: SnapshotMetadata = {

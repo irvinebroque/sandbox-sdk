@@ -70,7 +70,7 @@ export interface ApiErrorResponse {
   success: false;
   error: string;
   code: string;
-  details?: any;
+  details?: Record<string, unknown>;
   timestamp: string;
 }
 
@@ -80,7 +80,7 @@ export interface ApiErrorResponse {
 export interface ValidationErrorResponse {
   error: string;
   message: string;
-  details?: any[];
+  details?: Array<Record<string, unknown>>;
   timestamp: string;
 }
 
@@ -98,7 +98,7 @@ export interface ErrorResponse {
  */
 export interface RequestConfig extends RequestInit {
   endpoint: string;
-  data?: Record<string, any>;
+  data?: Record<string, unknown>;
 }
 
 /**

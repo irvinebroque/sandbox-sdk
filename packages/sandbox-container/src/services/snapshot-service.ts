@@ -176,6 +176,15 @@ export class SnapshotService {
       const fileCount = files.length;
       const totalBytes = manifestResult.totalSize || 0;
 
+      // Check snapshot size limit if configured
+      const maxSize = request.maxSnapshotSizeBytes;
+      if (maxSize && totalBytes > maxSize) {
+        return {
+          success: false,
+          error: `Snapshot size (${totalBytes} bytes) exceeds limit (${maxSize} bytes)`
+        };
+      }
+
       // 3. Create file list for tar (exclude patterns applied in manifest)
       const fileListPath = `/tmp/snapshot-${snapshotId}-files.txt`;
       const fileList = files.map((f: FileEntry) => f.path).join('\n');
@@ -424,15 +433,89 @@ export class SnapshotService {
 
         this.logger.debug('Downloading snapshot', { snapshotId });
 
-        // Download and extract in a single pipeline
-        // curl -> tar --extract --zstd
-        const extractCommand = `curl -s ${shellEscape(url)} | tar --extract --zstd --directory=${shellEscape(volumePath)} 2>&1`;
+        // Download to temp file for hash verification
+        const tempFile = `/tmp/snapshot-${snapshotId}-${Date.now()}.tar.zst`;
+        const downloadCommand = `curl -sf ${shellEscape(url)} -o ${shellEscape(tempFile)}`;
+
+        const downloadResult = await this.sessionManager.executeInSession(
+          SNAPSHOT_SESSION_ID,
+          downloadCommand,
+          volumePath,
+          timeout
+        );
+
+        if (!downloadResult.success) {
+          // Cleanup temp file on failure
+          await this.sessionManager.executeInSession(
+            SNAPSHOT_SESSION_ID,
+            `rm -f ${shellEscape(tempFile)}`,
+            '/tmp'
+          );
+          return {
+            success: false,
+            error: `Failed to download snapshot ${snapshotId}: ${downloadResult.error?.message || 'Download failed'}`
+          };
+        }
+
+        if (downloadResult.data.exitCode !== 0) {
+          // Cleanup temp file on failure
+          await this.sessionManager.executeInSession(
+            SNAPSHOT_SESSION_ID,
+            `rm -f ${shellEscape(tempFile)}`,
+            '/tmp'
+          );
+          return {
+            success: false,
+            error: `Failed to download snapshot ${snapshotId}: ${downloadResult.data.stderr || 'Download failed'}`
+          };
+        }
+
+        // Verify hash if provided (expectedHash may come from download.expectedHash)
+        const expectedHash = (download as { expectedHash?: string })
+          .expectedHash;
+        if (expectedHash) {
+          const hashCommand = `sha256sum ${shellEscape(tempFile)} | cut -d' ' -f1`;
+          const hashResult = await this.sessionManager.executeInSession(
+            SNAPSHOT_SESSION_ID,
+            hashCommand,
+            '/tmp'
+          );
+
+          if (hashResult.success && hashResult.data.stdout) {
+            const actualHash = hashResult.data.stdout.trim();
+            if (actualHash !== expectedHash) {
+              await this.sessionManager.executeInSession(
+                SNAPSHOT_SESSION_ID,
+                `rm -f ${shellEscape(tempFile)}`,
+                '/tmp'
+              );
+              return {
+                success: false,
+                error: `Snapshot ${snapshotId} integrity check failed: hash mismatch`
+              };
+            }
+            this.logger.debug('Snapshot hash verified', {
+              snapshotId,
+              hash: actualHash
+            });
+          }
+        }
+
+        // Extract from verified temp file
+        const extractCommand = `zstd -d -T0 < ${shellEscape(tempFile)} | tar --extract --directory=${shellEscape(volumePath)} 2>&1`;
 
         const extractResult = await this.sessionManager.executeInSession(
           SNAPSHOT_SESSION_ID,
           extractCommand,
           volumePath,
           timeout
+        );
+
+        // Cleanup temp file
+        await this.sessionManager.executeInSession(
+          SNAPSHOT_SESSION_ID,
+          `rm -f ${shellEscape(tempFile)}`,
+          '/tmp'
         );
 
         if (!extractResult.success) {
@@ -515,10 +598,41 @@ export class SnapshotService {
     }
 
     try {
+      // Validate exclude patterns to prevent command injection
+      if (excludePatterns && excludePatterns.length > 0) {
+        const DANGEROUS_CHARS = [
+          '..',
+          '\0',
+          '$(',
+          '`',
+          '\n',
+          '\r',
+          ';',
+          '|',
+          '&'
+        ];
+        for (const pattern of excludePatterns) {
+          for (const dangerous of DANGEROUS_CHARS) {
+            if (pattern.includes(dangerous)) {
+              return {
+                success: false,
+                error: `Invalid exclude pattern: contains forbidden characters`
+              };
+            }
+          }
+          if (pattern.startsWith('/')) {
+            return {
+              success: false,
+              error: `Invalid exclude pattern: absolute paths not allowed`
+            };
+          }
+        }
+      }
+
       // Build find command with exclude patterns
       let findCommand = `find ${shellEscape(volumePath)} -type f -o -type d -o -type l`;
 
-      // Add exclude patterns
+      // Add exclude patterns (now validated)
       if (excludePatterns && excludePatterns.length > 0) {
         const excludeArgs = excludePatterns
           .map((p: string) => `-not -path ${shellEscape(`${volumePath}/${p}`)}`)
@@ -559,7 +673,7 @@ export class SnapshotService {
         if (!fullPath || fullPath === volumePath) continue;
 
         // Get relative path
-        const path = fullPath.startsWith(volumePath + '/')
+        const path = fullPath.startsWith(`${volumePath}/`)
           ? fullPath.slice(volumePath.length + 1)
           : fullPath.slice(volumePath.length);
 
@@ -585,7 +699,7 @@ export class SnapshotService {
         const size = parseInt(sizeStr, 10) || 0;
         const mtime = parseInt(mtimeStr, 10) || 0;
 
-        // For symlinks, get target
+        // For symlinks, get target and validate it stays within volume
         let symlinkTarget: string | undefined;
         if (type === 'symlink') {
           const linkResult = await this.sessionManager.executeInSession(
@@ -594,7 +708,51 @@ export class SnapshotService {
             volumePath
           );
           if (linkResult.success && linkResult.data.exitCode === 0) {
-            symlinkTarget = linkResult.data.stdout.trim();
+            const target = linkResult.data.stdout.trim();
+
+            // Resolve the absolute path of the symlink target
+            let resolvedTarget: string;
+            if (target.startsWith('/')) {
+              resolvedTarget = target;
+            } else {
+              // Relative symlink - resolve from symlink's directory
+              const linkDir = fullPath.substring(0, fullPath.lastIndexOf('/'));
+              resolvedTarget = `${linkDir}/${target}`;
+            }
+
+            // Normalize the path (resolve . and ..)
+            // Simple normalization - split, filter, rejoin
+            const parts = resolvedTarget
+              .split('/')
+              .filter((p) => p && p !== '.');
+            const normalized: string[] = [];
+            for (const part of parts) {
+              if (part === '..') {
+                normalized.pop();
+              } else {
+                normalized.push(part);
+              }
+            }
+            resolvedTarget = `/${normalized.join('/')}`;
+
+            // Check if target is within volume path
+            if (
+              !resolvedTarget.startsWith(`${volumePath}/`) &&
+              resolvedTarget !== volumePath
+            ) {
+              this.logger.warn(
+                'Symlink points outside volume, excluding from snapshot',
+                {
+                  symlink: fullPath,
+                  target,
+                  resolvedTarget,
+                  volumePath
+                }
+              );
+              continue; // Skip this symlink
+            }
+
+            symlinkTarget = target;
           }
         }
 

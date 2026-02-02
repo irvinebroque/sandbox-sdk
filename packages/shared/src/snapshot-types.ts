@@ -123,6 +123,8 @@ export interface SnapshotConfig {
   maxSnapshots: number;
   /** Number of days to retain snapshots */
   retentionDays?: number;
+  /** Default TTL for snapshots when not specified per-snapshot (e.g., '30d'). If not set, snapshots never expire. */
+  defaultTtl?: string;
   /** Compression level for zstd */
   compressionLevel: 'fast' | 'balanced' | 'max';
   /** Glob patterns for files to exclude */
@@ -177,6 +179,9 @@ export interface SnapshotConfig {
    * package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb
    */
   lockfilePath?: string;
+
+  /** Maximum snapshot size in bytes (default: no limit) */
+  maxSnapshotSizeBytes?: number;
 }
 
 /**
@@ -189,6 +194,8 @@ export interface CreateSnapshotOptions {
   tags?: Record<string, string>;
   /** Create incremental snapshot from latest */
   incremental?: boolean;
+  /** TTL for this snapshot (e.g., '5d', '30d', '1w', 'forever'). If not set, uses config.defaultTtl or never expires. */
+  ttl?: string;
 }
 
 /**
@@ -250,6 +257,8 @@ export interface CreateSnapshotRequest {
   previousManifest?: SnapshotManifest;
   /** Operation timeout in milliseconds */
   timeout?: number;
+  /** Maximum snapshot size in bytes (default: no limit) */
+  maxSnapshotSizeBytes?: number;
 }
 
 /**

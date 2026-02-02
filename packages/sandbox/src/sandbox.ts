@@ -34,7 +34,18 @@ import {
   shellEscape,
   TraceContext
 } from '@repo/shared';
-import { type ExecuteResponse, SandboxClient } from './clients';
+import {
+  type CreateSnapshotRequest,
+  type CreateSnapshotResponse,
+  type DownloadSpec,
+  type ExecuteResponse,
+  type GetManifestRequest,
+  type GetManifestResponse,
+  type RestoreSnapshotRequest,
+  type RestoreSnapshotResponse,
+  SandboxClient,
+  type SnapshotManifest
+} from './clients';
 import type { ErrorResponse } from './errors';
 import {
   CustomDomainRequiredError,
@@ -2609,4 +2620,381 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   async deleteCodeContext(contextId: string): Promise<void> {
     return this.codeInterpreter.deleteCodeContext(contextId);
   }
+
+  // ============================================================================
+  // Volume Snapshot Methods
+  // ============================================================================
+
+  /**
+   * Configure snapshot settings for this sandbox
+   *
+   * @param config - Snapshot configuration
+   */
+  async configureSnapshots(config: SnapshotConfig): Promise<void> {
+    // Validate config
+    if (!config.volumePath) {
+      throw new Error('volumePath is required in snapshot configuration');
+    }
+
+    if (config.maxSnapshots !== undefined && config.maxSnapshots < 1) {
+      throw new Error('maxSnapshots must be at least 1');
+    }
+
+    // Store in DO storage
+    await this.ctx.storage.put('snapshot:config', config);
+
+    this.logger.info('Snapshot configuration saved', {
+      volumePath: config.volumePath,
+      enabled: config.enabled
+    });
+  }
+
+  /**
+   * Get current snapshot configuration
+   *
+   * @returns Current snapshot config or null if not configured
+   */
+  async getSnapshotConfig(): Promise<SnapshotConfig | null> {
+    return (
+      (await this.ctx.storage.get<SnapshotConfig>('snapshot:config')) || null
+    );
+  }
+
+  /**
+   * Create a snapshot of the configured volume
+   *
+   * @param uploadUrl - Presigned URL for uploading to R2
+   * @param options - Optional snapshot options
+   * @returns Snapshot metadata on success
+   */
+  async createSnapshot(
+    uploadUrl: string,
+    options?: CreateSnapshotOptions
+  ): Promise<SnapshotMetadata> {
+    const config = await this.getSnapshotConfig();
+    if (!config) {
+      throw new Error(
+        'Snapshots not configured. Call configureSnapshots() first.'
+      );
+    }
+
+    if (!config.enabled) {
+      throw new Error('Snapshots are disabled in configuration');
+    }
+
+    const snapshotId = options?.snapshotId || `snap-${Date.now()}`;
+
+    // Map compression level to numeric value
+    const compressionLevel =
+      config.compressionLevel === 'fast'
+        ? 1
+        : config.compressionLevel === 'max'
+          ? 19
+          : 3;
+
+    // Call container to create snapshot
+    const request: CreateSnapshotRequest = {
+      snapshotId,
+      volumePath: config.volumePath,
+      uploadUrl,
+      compressionLevel,
+      excludePatterns: config.excludePatterns || []
+    };
+
+    const response = await this.client.snapshots.create(request);
+
+    if (!response.success) {
+      throw new Error(response.error || 'Snapshot creation failed');
+    }
+
+    // Build metadata
+    const metadata: SnapshotMetadata = {
+      id: snapshotId,
+      sandboxId: this.sandboxName || this.ctx.id.toString(),
+      volumePath: config.volumePath,
+      createdAt: Date.now(),
+      r2Key: `snapshots/${this.sandboxName || this.ctx.id.toString()}/${snapshotId}.tar.zst`,
+      sizeBytes: response.stats?.compressedBytes || 0,
+      uncompressedBytes: response.stats?.totalBytes || 0,
+      fileCount: response.stats?.totalFiles || 0,
+      contentHash: response.contentHash || '',
+      isIncremental: false,
+      restoreCount: 0,
+      tags: options?.tags || {}
+    };
+
+    // Store metadata
+    await this.ctx.storage.put(`snapshot:meta:${snapshotId}`, metadata);
+
+    // Update snapshot list
+    const snapshots = await this.listSnapshots();
+    const snapshotIds = snapshots.map((s) => s.id);
+    snapshotIds.push(snapshotId);
+    await this.ctx.storage.put('snapshot:list', snapshotIds);
+
+    // Cleanup old snapshots if over limit
+    if (config.maxSnapshots && snapshots.length >= config.maxSnapshots) {
+      const toDelete = snapshots
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .slice(0, snapshots.length - config.maxSnapshots + 1);
+
+      for (const old of toDelete) {
+        await this.deleteSnapshotMetadata(old.id);
+      }
+    }
+
+    this.logger.info('Snapshot created', {
+      snapshotId,
+      fileCount: metadata.fileCount,
+      sizeBytes: metadata.sizeBytes
+    });
+
+    return metadata;
+  }
+
+  /**
+   * Restore a snapshot to the configured volume
+   *
+   * @param downloadUrl - Presigned URL for downloading from R2
+   * @param snapshotId - Optional specific snapshot ID (uses latest if not specified)
+   * @param options - Optional restore options
+   * @returns Restore result
+   */
+  async restoreSnapshot(
+    downloadUrl: string,
+    snapshotId?: string,
+    options?: RestoreOptions
+  ): Promise<RestoreResult> {
+    const config = await this.getSnapshotConfig();
+    if (!config) {
+      throw new Error(
+        'Snapshots not configured. Call configureSnapshots() first.'
+      );
+    }
+
+    // Get snapshot metadata
+    let metadata: SnapshotMetadata | undefined;
+    if (snapshotId) {
+      metadata = await this.ctx.storage.get<SnapshotMetadata>(
+        `snapshot:meta:${snapshotId}`
+      );
+    } else {
+      // Get latest snapshot
+      const snapshots = await this.listSnapshots();
+      if (snapshots.length === 0) {
+        throw new Error('No snapshots available to restore');
+      }
+      metadata = snapshots.sort((a, b) => b.createdAt - a.createdAt)[0];
+    }
+
+    if (!metadata) {
+      throw new Error(`Snapshot not found: ${snapshotId}`);
+    }
+
+    // Build download spec
+    const downloadSpec: DownloadSpec = {
+      snapshotId: metadata.id,
+      url: downloadUrl,
+      manifest: {
+        version: 1,
+        snapshotId: metadata.id,
+        files: [],
+        deletedPaths: []
+      },
+      expectedHash: metadata.contentHash
+    };
+
+    // Call container to restore
+    const request: RestoreSnapshotRequest = {
+      volumePath: config.volumePath,
+      downloads: [downloadSpec],
+      mode: options?.mode || 'clean'
+    };
+
+    const response = await this.client.snapshots.restore(request);
+
+    if (!response.success) {
+      throw new Error(response.error || 'Snapshot restore failed');
+    }
+
+    // Update metadata
+    metadata.lastRestoredAt = Date.now();
+    metadata.restoreCount += 1;
+    await this.ctx.storage.put(`snapshot:meta:${metadata.id}`, metadata);
+
+    this.logger.info('Snapshot restored', {
+      snapshotId: metadata.id,
+      filesRestored: response.stats?.filesRestored || 0
+    });
+
+    return {
+      success: true,
+      snapshotId: metadata.id,
+      stats: {
+        filesRestored: response.stats?.filesRestored || 0,
+        bytesDownloaded: response.stats?.bytesDownloaded || 0,
+        bytesExtracted: response.stats?.bytesExtracted || 0,
+        duration: response.stats?.duration || 0
+      }
+    };
+  }
+
+  /**
+   * List all snapshots for this sandbox
+   *
+   * @returns Array of snapshot metadata
+   */
+  async listSnapshots(): Promise<SnapshotMetadata[]> {
+    const snapshotIds =
+      (await this.ctx.storage.get<string[]>('snapshot:list')) || [];
+    const snapshots: SnapshotMetadata[] = [];
+
+    for (const id of snapshotIds) {
+      const metadata = await this.ctx.storage.get<SnapshotMetadata>(
+        `snapshot:meta:${id}`
+      );
+      if (metadata) {
+        snapshots.push(metadata);
+      }
+    }
+
+    return snapshots;
+  }
+
+  /**
+   * Delete a snapshot's metadata (does not delete R2 object)
+   *
+   * @param snapshotId - ID of snapshot to delete
+   */
+  async deleteSnapshotMetadata(snapshotId: string): Promise<void> {
+    await this.ctx.storage.delete(`snapshot:meta:${snapshotId}`);
+
+    // Update snapshot list
+    const snapshotIds =
+      (await this.ctx.storage.get<string[]>('snapshot:list')) || [];
+    const updatedIds = snapshotIds.filter((id) => id !== snapshotId);
+    await this.ctx.storage.put('snapshot:list', updatedIds);
+
+    this.logger.info('Snapshot metadata deleted', { snapshotId });
+  }
+
+  /**
+   * Get the current filesystem manifest for the configured volume
+   *
+   * @returns Manifest with file list
+   */
+  async getVolumeManifest(): Promise<GetManifestResponse> {
+    const config = await this.getSnapshotConfig();
+    if (!config) {
+      throw new Error(
+        'Snapshots not configured. Call configureSnapshots() first.'
+      );
+    }
+
+    const request: GetManifestRequest = {
+      volumePath: config.volumePath,
+      excludePatterns: config.excludePatterns || []
+    };
+
+    return this.client.snapshots.getManifest(request);
+  }
+}
+
+// ============================================================================
+// Snapshot Types (re-exported for convenience)
+// ============================================================================
+
+/**
+ * Configuration for snapshot behavior
+ */
+export interface SnapshotConfig {
+  /** Whether snapshots are enabled */
+  enabled: boolean;
+  /** Path to the volume to snapshot */
+  volumePath: string;
+  /** Automatically create snapshot when container sleeps */
+  autoSnapshotOnSleep: boolean;
+  /** Automatically restore latest snapshot when container wakes */
+  autoRestoreOnWake: boolean;
+  /** Maximum number of snapshots to retain */
+  maxSnapshots: number;
+  /** Number of days to retain snapshots */
+  retentionDays?: number;
+  /** Compression level for zstd */
+  compressionLevel: 'fast' | 'balanced' | 'max';
+  /** Glob patterns for files to exclude */
+  excludePatterns: string[];
+}
+
+/**
+ * Options for creating a snapshot
+ */
+export interface CreateSnapshotOptions {
+  /** Optional snapshot ID (auto-generated if not provided) */
+  snapshotId?: string;
+  /** User-defined tags */
+  tags?: Record<string, string>;
+  /** Create incremental snapshot from latest */
+  incremental?: boolean;
+}
+
+/**
+ * Options for restoring a snapshot
+ */
+export interface RestoreOptions {
+  /** How to handle existing files */
+  mode?: 'clean' | 'merge';
+}
+
+/**
+ * Result from restore operation
+ */
+export interface RestoreResult {
+  /** Whether restore succeeded */
+  success: boolean;
+  /** ID of snapshot that was restored */
+  snapshotId: string;
+  /** Statistics from restore */
+  stats: {
+    filesRestored: number;
+    bytesDownloaded: number;
+    bytesExtracted: number;
+    duration: number;
+  };
+}
+
+/**
+ * Metadata for a stored snapshot
+ */
+export interface SnapshotMetadata {
+  /** Unique identifier for this snapshot */
+  id: string;
+  /** ID of the sandbox that created this snapshot */
+  sandboxId: string;
+  /** Volume path that was snapshotted */
+  volumePath: string;
+  /** Unix timestamp when snapshot was created */
+  createdAt: number;
+  /** R2 object key for the snapshot archive */
+  r2Key: string;
+  /** Compressed size in bytes */
+  sizeBytes: number;
+  /** Uncompressed size in bytes */
+  uncompressedBytes: number;
+  /** Number of files in the snapshot */
+  fileCount: number;
+  /** SHA-256 hash of the archive content */
+  contentHash: string;
+  /** ID of base snapshot for incremental snapshots */
+  baseSnapshotId?: string;
+  /** Whether this is an incremental snapshot */
+  isIncremental: boolean;
+  /** Unix timestamp of last restore */
+  lastRestoredAt?: number;
+  /** Number of times this snapshot has been restored */
+  restoreCount: number;
+  /** Unix timestamp when snapshot expires (for auto-cleanup) */
+  expiresAt?: number;
+  /** User-defined tags for organization */
+  tags: Record<string, string>;
 }

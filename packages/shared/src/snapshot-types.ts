@@ -1,0 +1,267 @@
+/**
+ * Volume Snapshot Types
+ *
+ * Types for persisting and restoring container filesystem state via R2 storage.
+ * Uses tar/zstd streaming pipeline without FUSE for simple, reliable operation.
+ */
+
+// ============================================================================
+// Metadata Types
+// ============================================================================
+
+/**
+ * Metadata for a stored snapshot
+ * Persisted in Durable Object storage for tracking and retrieval
+ */
+export interface SnapshotMetadata {
+  /** Unique identifier for this snapshot */
+  id: string;
+  /** ID of the sandbox that created this snapshot */
+  sandboxId: string;
+  /** Volume path that was snapshotted */
+  volumePath: string;
+  /** Unix timestamp when snapshot was created */
+  createdAt: number;
+  /** R2 object key for the snapshot archive */
+  r2Key: string;
+  /** Compressed size in bytes */
+  sizeBytes: number;
+  /** Uncompressed size in bytes */
+  uncompressedBytes: number;
+  /** Number of files in the snapshot */
+  fileCount: number;
+  /** SHA-256 hash of the archive content */
+  contentHash: string;
+  /** ID of base snapshot for incremental snapshots */
+  baseSnapshotId?: string;
+  /** Whether this is an incremental snapshot */
+  isIncremental: boolean;
+  /** Unix timestamp of last restore */
+  lastRestoredAt?: number;
+  /** Number of times this snapshot has been restored */
+  restoreCount: number;
+  /** Unix timestamp when snapshot expires (for auto-cleanup) */
+  expiresAt?: number;
+  /** User-defined tags for organization */
+  tags: Record<string, string>;
+}
+
+/**
+ * Manifest describing files in a snapshot
+ * Used for incremental snapshots and validation
+ */
+export interface SnapshotManifest {
+  /** Manifest format version */
+  version: 1;
+  /** ID of the snapshot this manifest belongs to */
+  snapshotId: string;
+  /** ID of base snapshot (for incremental) */
+  baseSnapshotId?: string;
+  /** List of files in the snapshot */
+  files: FileEntry[];
+  /** Paths deleted since base snapshot (for incremental) */
+  deletedPaths: string[];
+}
+
+/**
+ * Entry describing a single file in a snapshot
+ */
+export interface FileEntry {
+  /** Relative path from volume root */
+  path: string;
+  /** Unix file mode (permissions) */
+  mode: number;
+  /** File size in bytes */
+  size: number;
+  /** Modification time as Unix timestamp */
+  mtime: number;
+  /** SHA-256 hash of file content */
+  hash: string;
+  /** Type of filesystem entry */
+  type: 'file' | 'directory' | 'symlink';
+  /** Target path for symlinks */
+  symlinkTarget?: string;
+}
+
+// ============================================================================
+// Configuration Types
+// ============================================================================
+
+/**
+ * Configuration for snapshot behavior
+ * Stored in Durable Object storage
+ */
+export interface SnapshotConfig {
+  /** Whether snapshots are enabled */
+  enabled: boolean;
+  /** Path to the volume to snapshot */
+  volumePath: string;
+  /** Automatically create snapshot when container sleeps */
+  autoSnapshotOnSleep: boolean;
+  /** Automatically restore latest snapshot when container wakes */
+  autoRestoreOnWake: boolean;
+  /** Maximum number of snapshots to retain */
+  maxSnapshots: number;
+  /** Number of days to retain snapshots */
+  retentionDays?: number;
+  /** Compression level for zstd */
+  compressionLevel: 'fast' | 'balanced' | 'max';
+  /** Glob patterns for files to exclude */
+  excludePatterns: string[];
+}
+
+/**
+ * Options for creating a snapshot
+ */
+export interface CreateSnapshotOptions {
+  /** Optional snapshot ID (auto-generated if not provided) */
+  snapshotId?: string;
+  /** User-defined tags */
+  tags?: Record<string, string>;
+  /** Create incremental snapshot from latest */
+  incremental?: boolean;
+}
+
+/**
+ * Options for restoring a snapshot
+ */
+export interface RestoreOptions {
+  /** How to handle existing files */
+  mode?: 'clean' | 'merge';
+}
+
+/**
+ * Result from restore operation
+ */
+export interface RestoreResult {
+  /** Whether restore succeeded */
+  success: boolean;
+  /** ID of snapshot that was restored */
+  snapshotId: string;
+  /** Statistics from restore */
+  stats: {
+    filesRestored: number;
+    bytesDownloaded: number;
+    bytesExtracted: number;
+    duration: number;
+  };
+}
+
+// ============================================================================
+// Container API Request/Response Types
+// ============================================================================
+
+/**
+ * Request to create a snapshot in the container
+ */
+export interface CreateSnapshotRequest {
+  /** Unique ID for this snapshot */
+  snapshotId: string;
+  /** Path to snapshot */
+  volumePath: string;
+  /** Presigned URL to upload archive to R2 */
+  uploadUrl: string;
+  /** Zstd compression level (1-19) */
+  compressionLevel: number;
+  /** Glob patterns for files to exclude */
+  excludePatterns: string[];
+  /** Previous manifest for incremental snapshots */
+  previousManifest?: SnapshotManifest;
+  /** Operation timeout in milliseconds */
+  timeout?: number;
+}
+
+/**
+ * Response from snapshot creation
+ */
+export interface CreateSnapshotResponse {
+  /** Whether creation succeeded */
+  success: boolean;
+  /** Manifest of files in snapshot */
+  manifest?: SnapshotManifest;
+  /** SHA-256 hash of archive content */
+  contentHash?: string;
+  /** Statistics from creation */
+  stats?: {
+    totalFiles: number;
+    totalBytes: number;
+    compressedBytes: number;
+    duration: number;
+    skippedFiles: number;
+    unchangedFiles: number;
+  };
+  /** Error message if failed */
+  error?: string;
+}
+
+/**
+ * Request to restore a snapshot in the container
+ */
+export interface RestoreSnapshotRequest {
+  /** Path to restore to */
+  volumePath: string;
+  /** Snapshots to download and apply (in order) */
+  downloads: DownloadSpec[];
+  /** How to handle existing files: 'clean' removes all, 'merge' keeps unmodified */
+  mode: 'clean' | 'merge';
+  /** Operation timeout in milliseconds */
+  timeout?: number;
+}
+
+/**
+ * Specification for a snapshot to download
+ */
+export interface DownloadSpec {
+  /** ID of the snapshot */
+  snapshotId: string;
+  /** Presigned URL to download from R2 */
+  url: string;
+  /** Manifest for validation */
+  manifest: SnapshotManifest;
+  /** Expected SHA-256 hash for verification */
+  expectedHash?: string;
+}
+
+/**
+ * Response from snapshot restore
+ */
+export interface RestoreSnapshotResponse {
+  /** Whether restore succeeded */
+  success: boolean;
+  /** Statistics from restore */
+  stats?: {
+    filesRestored: number;
+    bytesDownloaded: number;
+    bytesExtracted: number;
+    duration: number;
+    snapshotsApplied: number;
+  };
+  /** Error message if failed */
+  error?: string;
+}
+
+/**
+ * Request to get current filesystem manifest
+ */
+export interface GetManifestRequest {
+  /** Path to scan */
+  volumePath: string;
+  /** Glob patterns for files to exclude */
+  excludePatterns: string[];
+}
+
+/**
+ * Response with filesystem manifest
+ */
+export interface GetManifestResponse {
+  /** Whether operation succeeded */
+  success: boolean;
+  /** List of files found */
+  files?: FileEntry[];
+  /** Total size of all files */
+  totalSize?: number;
+  /** Number of files found */
+  fileCount?: number;
+  /** Error message if failed */
+  error?: string;
+}

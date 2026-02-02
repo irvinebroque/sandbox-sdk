@@ -15,6 +15,7 @@ export { GitClient } from './git-client';
 export { InterpreterClient } from './interpreter-client';
 export { PortClient } from './port-client';
 export { ProcessClient } from './process-client';
+export { SnapshotClient } from './snapshot-client';
 export { UtilityClient } from './utility-client';
 
 // =============================================================================
@@ -69,6 +70,18 @@ export type {
   ProcessStartResult,
   StartProcessRequest
 } from './process-client';
+// Snapshot client types
+export type {
+  CreateSnapshotRequest,
+  CreateSnapshotResponse,
+  DownloadSpec,
+  FileEntry as SnapshotFileEntry,
+  GetManifestRequest,
+  GetManifestResponse,
+  RestoreSnapshotRequest,
+  RestoreSnapshotResponse,
+  SnapshotManifest
+} from './snapshot-client';
 // Core types
 export type {
   BaseApiResponse,

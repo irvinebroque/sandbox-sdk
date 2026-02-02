@@ -8,9 +8,18 @@ export {
   PortClient,
   ProcessClient,
   SandboxClient,
+  SnapshotClient,
   UtilityClient
 } from './clients';
-export { getSandbox, Sandbox } from './sandbox';
+export {
+  type CreateSnapshotOptions,
+  getSandbox,
+  type RestoreOptions,
+  type RestoreResult,
+  Sandbox,
+  type SnapshotConfig,
+  type SnapshotMetadata
+} from './sandbox';
 
 // Legacy types are now imported from the new client architecture
 

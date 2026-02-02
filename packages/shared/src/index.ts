@@ -52,6 +52,23 @@ export type {
 } from './request-types.js';
 // Export shell utilities
 export { shellEscape } from './shell-escape.js';
+// Export all snapshot types
+export type {
+  CreateSnapshotOptions,
+  CreateSnapshotRequest,
+  CreateSnapshotResponse,
+  DownloadSpec,
+  FileEntry,
+  GetManifestRequest,
+  GetManifestResponse,
+  RestoreOptions,
+  RestoreResult,
+  RestoreSnapshotRequest,
+  RestoreSnapshotResponse,
+  SnapshotConfig,
+  SnapshotManifest,
+  SnapshotMetadata
+} from './snapshot-types.js';
 // Export all types from types.ts
 export type {
   BaseExecOptions,

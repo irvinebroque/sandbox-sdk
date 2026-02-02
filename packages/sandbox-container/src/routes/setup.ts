@@ -274,6 +274,31 @@ export function setupRoutes(router: Router, container: Container): void {
     middleware: [container.get('loggingMiddleware')]
   });
 
+  // Snapshot routes
+  router.register({
+    method: 'POST',
+    path: '/api/snapshot/create',
+    handler: async (req, ctx) =>
+      container.get('snapshotHandler').handle(req, ctx),
+    middleware: [container.get('loggingMiddleware')]
+  });
+
+  router.register({
+    method: 'POST',
+    path: '/api/snapshot/restore',
+    handler: async (req, ctx) =>
+      container.get('snapshotHandler').handle(req, ctx),
+    middleware: [container.get('loggingMiddleware')]
+  });
+
+  router.register({
+    method: 'POST',
+    path: '/api/snapshot/manifest',
+    handler: async (req, ctx) =>
+      container.get('snapshotHandler').handle(req, ctx),
+    middleware: [container.get('loggingMiddleware')]
+  });
+
   // Miscellaneous routes
   router.register({
     method: 'GET',

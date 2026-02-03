@@ -36,6 +36,13 @@ export interface HttpClientOptions {
   onError?: (error: string, command?: string) => void;
 
   /**
+   * Enable verbose debug logging for SDK requests.
+   * When true, logs request/response details including method, path, timing, and retries.
+   * @default false
+   */
+  debug?: boolean;
+
+  /**
    * Transport mode: 'http' (default) or 'websocket'
    * WebSocket mode multiplexes all requests over a single connection,
    * reducing sub-request count in Workers/Durable Objects.

@@ -126,4 +126,28 @@ export class SnapshotClient extends BaseHttpClient {
       throw error;
     }
   }
+
+  /**
+   * Read a lockfile directly without session locking.
+   * Used for content-addressed cache key computation.
+   * This bypasses the session system to avoid lock contention.
+   *
+   * @param path - Path to the lockfile
+   * @returns Response with file content or null if not found
+   */
+  async readLockfile(
+    path: string
+  ): Promise<{ success: boolean; content: string | null }> {
+    try {
+      const response = await this.post<{
+        success: boolean;
+        content: string | null;
+      }>('/api/snapshot/lockfile', { path });
+
+      return response;
+    } catch (error) {
+      this.logError('readLockfile', error);
+      throw error;
+    }
+  }
 }

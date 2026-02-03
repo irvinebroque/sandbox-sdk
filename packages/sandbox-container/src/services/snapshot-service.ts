@@ -19,7 +19,6 @@ import type {
   SnapshotProgressEvent
 } from '@repo/shared';
 import { shellEscape } from '@repo/shared';
-import type { SessionManager } from './session-manager';
 
 // Re-export types for handler imports
 export type {
@@ -56,12 +55,6 @@ function getZstdLevel(level: 'fast' | 'balanced' | 'max' | number): number {
       return 3;
   }
 }
-
-/**
- * Session ID used for snapshot operations
- * Uses a dedicated session to avoid interfering with user sessions
- */
-const SNAPSHOT_SESSION_ID = '__snapshot__';
 
 /**
  * Sanitizes a URL by removing query parameters to prevent credential leakage.
@@ -134,10 +127,87 @@ function validateDownloadUrl(url: string): void {
 
 export class SnapshotService {
   constructor(
-    private sessionManager: SessionManager,
     private security: SecurityService,
     private logger: Logger
   ) {}
+
+  /**
+   * Execute a shell command directly without session management.
+   * Used for snapshot operations that don't need persistent shell state.
+   */
+  private async execDirect(
+    command: string,
+    options?: { cwd?: string; timeoutMs?: number }
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const proc = Bun.spawn(['bash', '-c', command], {
+      cwd: options?.cwd,
+      stdout: 'pipe',
+      stderr: 'pipe'
+    });
+
+    // Handle timeout if specified
+    let timeoutId: Timer | undefined;
+    if (options?.timeoutMs) {
+      timeoutId = setTimeout(() => {
+        proc.kill();
+      }, options.timeoutMs);
+    }
+
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text()
+      ]);
+
+      const exitCode = await proc.exited;
+      return { stdout, stderr, exitCode };
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  }
+
+  /**
+   * Read file directly without session management.
+   */
+  private async readFileDirect(path: string): Promise<string> {
+    const file = Bun.file(path);
+    if (!(await file.exists())) {
+      throw new Error(`File not found: ${path}`);
+    }
+    return await file.text();
+  }
+
+  /**
+   * Write file directly without session management.
+   */
+  private async writeFileDirect(path: string, content: string): Promise<void> {
+    await Bun.write(path, content);
+  }
+
+  /**
+   * Check if path exists directly.
+   */
+  private async existsDirect(path: string): Promise<boolean> {
+    const file = Bun.file(path);
+    return await file.exists();
+  }
+
+  /**
+   * Check if path is a directory.
+   */
+  private async isDirectoryDirect(path: string): Promise<boolean> {
+    try {
+      const result = await this.execDirect(
+        `test -d ${shellEscape(path)} && echo "dir"`,
+        { timeoutMs: 5000 }
+      );
+      return result.stdout.trim() === 'dir';
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * Build optimized zstd arguments based on compression level
@@ -207,21 +277,8 @@ export class SnapshotService {
 
     try {
       // 1. Validate volume path exists
-      const existsResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        `test -d ${shellEscape(volumePath)} && echo "exists"`,
-        volumePath,
-        timeout
-      );
-
-      if (!existsResult.success) {
-        return {
-          success: false,
-          error: `Failed to check volume path: ${existsResult.error?.message || 'Unknown error'}`
-        };
-      }
-
-      if (!existsResult.data.stdout.includes('exists')) {
+      const volumeExists = await this.isDirectoryDirect(volumePath);
+      if (!volumeExists) {
         return {
           success: false,
           error: `Volume path does not exist: ${volumePath}`
@@ -259,28 +316,8 @@ export class SnapshotService {
       const fileListPath = `/tmp/snapshot-${crypto.randomUUID()}-files.txt`;
       const fileList = files.map((f: FileEntry) => f.path).join('\n');
 
-      // Write file list using base64 encoding to safely pass content
-      const encodedList = Buffer.from(fileList).toString('base64');
-      const writeResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        `echo ${shellEscape(encodedList)} | base64 -d > ${shellEscape(fileListPath)}`,
-        volumePath,
-        timeout
-      );
-
-      if (!writeResult.success) {
-        return {
-          success: false,
-          error: `Failed to write file list: ${writeResult.error?.message || 'Unknown error'}`
-        };
-      }
-
-      if (writeResult.data.exitCode !== 0) {
-        return {
-          success: false,
-          error: `Failed to write file list: ${writeResult.data.stderr || 'Unknown error'}`
-        };
-      }
+      // Write file list directly
+      await this.writeFileDirect(fileListPath, fileList);
 
       // Validate upload URL before using it
       validateUploadUrl(uploadUrl);
@@ -301,88 +338,62 @@ export class SnapshotService {
         `--files-from=${shellEscape(fileListPath)} ` +
         `-f ${shellEscape(archivePath)} 2>&1`;
 
-      const tarResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        tarCommand,
-        volumePath,
-        timeout
-      );
+      const tarResult = await this.execDirect(tarCommand, {
+        cwd: volumePath,
+        timeoutMs: timeout
+      });
 
-      if (!tarResult.success) {
+      if (tarResult.exitCode !== 0) {
         await this.cleanupTempFiles([fileListPath, archivePath]);
         return {
           success: false,
-          error: `Failed to create tar archive: ${tarResult.error?.message || 'Unknown error'}`
-        };
-      }
-
-      if (tarResult.data.exitCode !== 0) {
-        await this.cleanupTempFiles([fileListPath, archivePath]);
-        return {
-          success: false,
-          error: `Failed to create tar archive: ${tarResult.data.stderr || tarResult.data.stdout || 'Unknown error'}`
+          error: `Failed to create tar archive: ${tarResult.stderr || tarResult.stdout || 'Unknown error'}`
         };
       }
 
       // 5. Get archive size and hash
-      const statResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
+      const statResult = await this.execDirect(
         `stat -c '%s' ${shellEscape(archivePath)} && sha256sum ${shellEscape(archivePath)} | cut -d' ' -f1`,
-        volumePath,
-        timeout
+        { cwd: volumePath, timeoutMs: timeout }
       );
 
-      if (!statResult.success) {
+      if (statResult.exitCode !== 0) {
         await this.cleanupTempFiles([fileListPath, archivePath]);
         return {
           success: false,
-          error: `Failed to get archive stats: ${statResult.error?.message || 'Unknown error'}`
+          error: `Failed to get archive stats: ${statResult.stderr || 'Unknown error'}`
         };
       }
 
-      if (statResult.data.exitCode !== 0) {
-        await this.cleanupTempFiles([fileListPath, archivePath]);
-        return {
-          success: false,
-          error: `Failed to get archive stats: ${statResult.data.stderr || 'Unknown error'}`
-        };
-      }
-
-      const [sizeStr, contentHash] = statResult.data.stdout.trim().split('\n');
+      const [sizeStr, contentHash] = statResult.stdout.trim().split('\n');
       const compressedBytes = parseInt(sizeStr, 10);
 
       // 6. Upload to R2 via curl
+      // --connect-timeout 30: fail if connection not established in 30s
+      // --max-time 300: fail if upload takes longer than 5 minutes
       const uploadCommand =
         `curl -s -X PUT -H "Content-Type: application/zstd" ` +
+        `--connect-timeout 30 --max-time 300 ` +
         `--data-binary @${shellEscape(archivePath)} ` +
         `${shellEscape(uploadUrl)} -w "%{http_code}"`;
 
-      const uploadResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        uploadCommand,
-        volumePath,
-        timeout
-      );
+      const uploadResult = await this.execDirect(uploadCommand, {
+        cwd: volumePath,
+        timeoutMs: timeout
+      });
 
       // Cleanup temp files
       await this.cleanupTempFiles([fileListPath, archivePath]);
 
-      if (!uploadResult.success) {
+      if (uploadResult.exitCode !== 0) {
         return {
           success: false,
-          error: `Failed to upload archive: ${uploadResult.error?.message || 'Unknown error'}`
-        };
-      }
-
-      if (uploadResult.data.exitCode !== 0) {
-        return {
-          success: false,
-          error: `Failed to upload archive: ${sanitizeErrorOutput(uploadResult.data.stderr || 'Unknown error')}`
+          error: `Failed to upload archive: ${sanitizeErrorOutput(uploadResult.stderr || 'Unknown error')}`
         };
       }
 
       // Check HTTP status code (last characters of stdout)
-      const httpStatus = uploadResult.data.stdout.trim().slice(-3);
+      const httpStatus = uploadResult.stdout.trim().slice(-3);
       if (!httpStatus.startsWith('2')) {
         return {
           success: false,
@@ -465,34 +476,23 @@ export class SnapshotService {
       // 1. Prepare volume path
       if (mode === 'clean') {
         // Remove all existing files (but keep the directory)
-        await this.sessionManager.executeInSession(
-          SNAPSHOT_SESSION_ID,
+        await this.execDirect(
           `rm -rf ${shellEscape(volumePath)}/* ${shellEscape(volumePath)}/.[!.]* 2>/dev/null; mkdir -p ${shellEscape(volumePath)}`,
-          '/tmp',
-          timeout
+          { cwd: '/tmp', timeoutMs: timeout }
         );
         // mkdir -p should always succeed if we have permissions
         // rm may fail if directory is empty, which is fine
       } else {
         // Ensure directory exists for merge mode
-        const mkdirResult = await this.sessionManager.executeInSession(
-          SNAPSHOT_SESSION_ID,
+        const mkdirResult = await this.execDirect(
           `mkdir -p ${shellEscape(volumePath)}`,
-          '/tmp',
-          timeout
+          { cwd: '/tmp', timeoutMs: timeout }
         );
 
-        if (!mkdirResult.success) {
+        if (mkdirResult.exitCode !== 0) {
           return {
             success: false,
-            error: `Failed to create volume path: ${mkdirResult.error?.message || 'Unknown error'}`
-          };
-        }
-
-        if (mkdirResult.data.exitCode !== 0) {
-          return {
-            success: false,
-            error: `Failed to create volume path: ${mkdirResult.data.stderr || 'Unknown error'}`
+            error: `Failed to create volume path: ${mkdirResult.stderr || 'Unknown error'}`
           };
         }
       }
@@ -516,39 +516,24 @@ export class SnapshotService {
         this.logger.debug('Downloading snapshot', { snapshotId });
 
         // Download to temp file for hash verification
+        // --connect-timeout 30: fail if connection not established in 30s
+        // --max-time 300: fail if download takes longer than 5 minutes
         const tempFile = `/tmp/snapshot-${crypto.randomUUID()}.tar.zst`;
-        const downloadCommand = `curl -sf ${shellEscape(url)} -o ${shellEscape(tempFile)}`;
+        const downloadCommand = `curl -sf --connect-timeout 30 --max-time 300 ${shellEscape(url)} -o ${shellEscape(tempFile)}`;
 
-        const downloadResult = await this.sessionManager.executeInSession(
-          SNAPSHOT_SESSION_ID,
-          downloadCommand,
-          volumePath,
-          timeout
-        );
+        const downloadResult = await this.execDirect(downloadCommand, {
+          cwd: volumePath,
+          timeoutMs: timeout
+        });
 
-        if (!downloadResult.success) {
+        if (downloadResult.exitCode !== 0) {
           // Cleanup temp file on failure
-          await this.sessionManager.executeInSession(
-            SNAPSHOT_SESSION_ID,
-            `rm -f ${shellEscape(tempFile)}`,
-            '/tmp'
-          );
+          await this.execDirect(`rm -f ${shellEscape(tempFile)}`, {
+            cwd: '/tmp'
+          });
           return {
             success: false,
-            error: `Failed to download snapshot ${snapshotId}: ${downloadResult.error?.message || 'Download failed'}`
-          };
-        }
-
-        if (downloadResult.data.exitCode !== 0) {
-          // Cleanup temp file on failure
-          await this.sessionManager.executeInSession(
-            SNAPSHOT_SESSION_ID,
-            `rm -f ${shellEscape(tempFile)}`,
-            '/tmp'
-          );
-          return {
-            success: false,
-            error: `Failed to download snapshot ${snapshotId}: ${sanitizeErrorOutput(downloadResult.data.stderr || 'Download failed')}`
+            error: `Failed to download snapshot ${snapshotId}: ${sanitizeErrorOutput(downloadResult.stderr || 'Download failed')}`
           };
         }
 
@@ -557,20 +542,16 @@ export class SnapshotService {
           .expectedHash;
         if (expectedHash) {
           const hashCommand = `sha256sum ${shellEscape(tempFile)} | cut -d' ' -f1`;
-          const hashResult = await this.sessionManager.executeInSession(
-            SNAPSHOT_SESSION_ID,
-            hashCommand,
-            '/tmp'
-          );
+          const hashResult = await this.execDirect(hashCommand, {
+            cwd: '/tmp'
+          });
 
-          if (hashResult.success && hashResult.data.stdout) {
-            const actualHash = hashResult.data.stdout.trim();
+          if (hashResult.exitCode === 0 && hashResult.stdout) {
+            const actualHash = hashResult.stdout.trim();
             if (actualHash !== expectedHash) {
-              await this.sessionManager.executeInSession(
-                SNAPSHOT_SESSION_ID,
-                `rm -f ${shellEscape(tempFile)}`,
-                '/tmp'
-              );
+              await this.execDirect(`rm -f ${shellEscape(tempFile)}`, {
+                cwd: '/tmp'
+              });
               return {
                 success: false,
                 error: `Snapshot ${snapshotId} integrity check failed: hash mismatch`
@@ -586,31 +567,20 @@ export class SnapshotService {
         // Extract from verified temp file
         const extractCommand = `zstd -d -T0 < ${shellEscape(tempFile)} | tar --extract --directory=${shellEscape(volumePath)} 2>&1`;
 
-        const extractResult = await this.sessionManager.executeInSession(
-          SNAPSHOT_SESSION_ID,
-          extractCommand,
-          volumePath,
-          timeout
-        );
+        const extractResult = await this.execDirect(extractCommand, {
+          cwd: volumePath,
+          timeoutMs: timeout
+        });
 
         // Cleanup temp file
-        await this.sessionManager.executeInSession(
-          SNAPSHOT_SESSION_ID,
-          `rm -f ${shellEscape(tempFile)}`,
-          '/tmp'
-        );
+        await this.execDirect(`rm -f ${shellEscape(tempFile)}`, {
+          cwd: '/tmp'
+        });
 
-        if (!extractResult.success) {
+        if (extractResult.exitCode !== 0) {
           return {
             success: false,
-            error: `Failed to extract snapshot ${snapshotId}: ${extractResult.error?.message || 'Unknown error'}`
-          };
-        }
-
-        if (extractResult.data.exitCode !== 0) {
-          return {
-            success: false,
-            error: `Failed to extract snapshot ${snapshotId}: ${extractResult.data.stderr || extractResult.data.stdout || 'Unknown error'}`
+            error: `Failed to extract snapshot ${snapshotId}: ${extractResult.stderr || extractResult.stdout || 'Unknown error'}`
           };
         }
 
@@ -618,11 +588,9 @@ export class SnapshotService {
         if (manifest.deletedPaths && manifest.deletedPaths.length > 0) {
           for (const deletedPath of manifest.deletedPaths) {
             const fullPath = `${volumePath}/${deletedPath}`;
-            await this.sessionManager.executeInSession(
-              SNAPSHOT_SESSION_ID,
+            await this.execDirect(
               `rm -rf ${shellEscape(fullPath)} 2>/dev/null || true`,
-              volumePath,
-              timeout
+              { cwd: volumePath, timeoutMs: timeout }
             );
           }
         }
@@ -742,16 +710,14 @@ export class SnapshotService {
         `${findCommand} 2>/dev/null | while read f; do ` +
         `stat -c '${statFormat}' "$f" 2>/dev/null || true; done`;
 
-      const listResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        listCommand,
-        volumePath
-      );
+      const listResult = await this.execDirect(listCommand, {
+        cwd: volumePath
+      });
 
-      if (!listResult.success) {
+      if (listResult.exitCode !== 0) {
         return {
           success: false,
-          error: `Failed to list files: ${listResult.error?.message || 'Unknown error'}`
+          error: `Failed to list files: ${listResult.stderr || 'Unknown error'}`
         };
       }
 
@@ -759,7 +725,7 @@ export class SnapshotService {
       const files: FileEntry[] = [];
       let totalSize = 0;
 
-      const lines = listResult.data.stdout.trim().split('\n').filter(Boolean);
+      const lines = listResult.stdout.trim().split('\n').filter(Boolean);
 
       for (const line of lines) {
         const [fullPath, typeChar, modeStr, sizeStr, mtimeStr] =
@@ -797,13 +763,12 @@ export class SnapshotService {
         // For symlinks, get target and validate it stays within volume
         let symlinkTarget: string | undefined;
         if (type === 'symlink') {
-          const linkResult = await this.sessionManager.executeInSession(
-            SNAPSHOT_SESSION_ID,
+          const linkResult = await this.execDirect(
             `readlink ${shellEscape(fullPath)}`,
-            volumePath
+            { cwd: volumePath }
           );
-          if (linkResult.success && linkResult.data.exitCode === 0) {
-            const target = linkResult.data.stdout.trim();
+          if (linkResult.exitCode === 0) {
+            const target = linkResult.stdout.trim();
 
             // Resolve the absolute path of the symlink target
             let resolvedTarget: string;
@@ -854,13 +819,12 @@ export class SnapshotService {
         // Compute hash for files (skip for directories and symlinks)
         let hash = '';
         if (!skipFileHashes && type === 'file' && size > 0) {
-          const hashResult = await this.sessionManager.executeInSession(
-            SNAPSHOT_SESSION_ID,
+          const hashResult = await this.execDirect(
             `sha256sum ${shellEscape(fullPath)} | cut -d' ' -f1`,
-            volumePath
+            { cwd: volumePath }
           );
-          if (hashResult.success && hashResult.data.exitCode === 0) {
-            hash = hashResult.data.stdout.trim();
+          if (hashResult.exitCode === 0) {
+            hash = hashResult.stdout.trim();
           }
         }
 
@@ -905,11 +869,7 @@ export class SnapshotService {
   private async cleanupTempFiles(paths: string[]): Promise<void> {
     for (const path of paths) {
       try {
-        await this.sessionManager.executeInSession(
-          SNAPSHOT_SESSION_ID,
-          `rm -f ${shellEscape(path)}`,
-          '/tmp'
-        );
+        await this.execDirect(`rm -f ${shellEscape(path)}`, { cwd: '/tmp' });
       } catch (error) {
         this.logger.warn(`Failed to cleanup temp file: ${path}`, {
           error: error instanceof Error ? error.message : String(error)
@@ -982,29 +942,8 @@ export class SnapshotService {
         `Validating volume path: ${volumePath}`
       );
 
-      const existsResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        `test -d ${shellEscape(volumePath)} && echo "exists"`,
-        volumePath,
-        timeout
-      );
-
-      if (!existsResult.success) {
-        const errorMsg = `Failed to check volume path: ${existsResult.error?.message || 'Unknown error'}`;
-        yield createProgressEvent(
-          'error',
-          'error',
-          errorMsg,
-          undefined,
-          errorMsg
-        );
-        return {
-          success: false,
-          error: errorMsg
-        };
-      }
-
-      if (!existsResult.data.stdout.includes('exists')) {
+      const volumeExists = await this.isDirectoryDirect(volumePath);
+      if (!volumeExists) {
         const errorMsg = `Volume path does not exist: ${volumePath}`;
         yield createProgressEvent(
           'error',
@@ -1070,44 +1009,8 @@ export class SnapshotService {
       const fileListPath = `/tmp/snapshot-${crypto.randomUUID()}-files.txt`;
       const fileList = files.map((f: FileEntry) => f.path).join('\n');
 
-      // Write file list using base64 encoding to safely pass content
-      const encodedList = Buffer.from(fileList).toString('base64');
-      const writeResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        `echo ${shellEscape(encodedList)} | base64 -d > ${shellEscape(fileListPath)}`,
-        volumePath,
-        timeout
-      );
-
-      if (!writeResult.success) {
-        const errorMsg = `Failed to write file list: ${writeResult.error?.message || 'Unknown error'}`;
-        yield createProgressEvent(
-          'error',
-          'error',
-          errorMsg,
-          undefined,
-          errorMsg
-        );
-        return {
-          success: false,
-          error: errorMsg
-        };
-      }
-
-      if (writeResult.data.exitCode !== 0) {
-        const errorMsg = `Failed to write file list: ${writeResult.data.stderr || 'Unknown error'}`;
-        yield createProgressEvent(
-          'error',
-          'error',
-          errorMsg,
-          undefined,
-          errorMsg
-        );
-        return {
-          success: false,
-          error: errorMsg
-        };
-      }
+      // Write file list directly
+      await this.writeFileDirect(fileListPath, fileList);
 
       // Validate upload URL before using it
       validateUploadUrl(uploadUrl);
@@ -1124,32 +1027,14 @@ export class SnapshotService {
         `--files-from=${shellEscape(fileListPath)} ` +
         `-f ${shellEscape(archivePath)} 2>&1`;
 
-      const tarResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        tarCommand,
-        volumePath,
-        timeout
-      );
+      const tarResult = await this.execDirect(tarCommand, {
+        cwd: volumePath,
+        timeoutMs: timeout
+      });
 
-      if (!tarResult.success) {
+      if (tarResult.exitCode !== 0) {
         await this.cleanupTempFiles([fileListPath, archivePath]);
-        const errorMsg = `Failed to create tar archive: ${tarResult.error?.message || 'Unknown error'}`;
-        yield createProgressEvent(
-          'error',
-          'error',
-          errorMsg,
-          undefined,
-          errorMsg
-        );
-        return {
-          success: false,
-          error: errorMsg
-        };
-      }
-
-      if (tarResult.data.exitCode !== 0) {
-        await this.cleanupTempFiles([fileListPath, archivePath]);
-        const errorMsg = `Failed to create tar archive: ${tarResult.data.stderr || tarResult.data.stdout || 'Unknown error'}`;
+        const errorMsg = `Failed to create tar archive: ${tarResult.stderr || tarResult.stdout || 'Unknown error'}`;
         yield createProgressEvent(
           'error',
           'error',
@@ -1164,16 +1049,14 @@ export class SnapshotService {
       }
 
       // Get archive size and hash
-      const statResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
+      const statResult = await this.execDirect(
         `stat -c '%s' ${shellEscape(archivePath)} && sha256sum ${shellEscape(archivePath)} | cut -d' ' -f1`,
-        volumePath,
-        timeout
+        { cwd: volumePath, timeoutMs: timeout }
       );
 
-      if (!statResult.success) {
+      if (statResult.exitCode !== 0) {
         await this.cleanupTempFiles([fileListPath, archivePath]);
-        const errorMsg = `Failed to get archive stats: ${statResult.error?.message || 'Unknown error'}`;
+        const errorMsg = `Failed to get archive stats: ${statResult.stderr || 'Unknown error'}`;
         yield createProgressEvent(
           'error',
           'error',
@@ -1187,23 +1070,7 @@ export class SnapshotService {
         };
       }
 
-      if (statResult.data.exitCode !== 0) {
-        await this.cleanupTempFiles([fileListPath, archivePath]);
-        const errorMsg = `Failed to get archive stats: ${statResult.data.stderr || 'Unknown error'}`;
-        yield createProgressEvent(
-          'error',
-          'error',
-          errorMsg,
-          undefined,
-          errorMsg
-        );
-        return {
-          success: false,
-          error: errorMsg
-        };
-      }
-
-      const [sizeStr, contentHash] = statResult.data.stdout.trim().split('\n');
+      const [sizeStr, contentHash] = statResult.stdout.trim().split('\n');
       const compressedBytes = parseInt(sizeStr, 10);
 
       yield createProgressEvent(
@@ -1221,38 +1088,24 @@ export class SnapshotService {
         { totalFiles: fileCount, totalBytes, compressedBytes }
       );
 
+      // --connect-timeout 30: fail if connection not established in 30s
+      // --max-time 300: fail if upload takes longer than 5 minutes
       const uploadCommand =
         `curl -s -X PUT -H "Content-Type: application/zstd" ` +
+        `--connect-timeout 30 --max-time 300 ` +
         `--data-binary @${shellEscape(archivePath)} ` +
         `${shellEscape(uploadUrl)} -w "%{http_code}"`;
 
-      const uploadResult = await this.sessionManager.executeInSession(
-        SNAPSHOT_SESSION_ID,
-        uploadCommand,
-        volumePath,
-        timeout
-      );
+      const uploadResult = await this.execDirect(uploadCommand, {
+        cwd: volumePath,
+        timeoutMs: timeout
+      });
 
       // Cleanup temp files
       await this.cleanupTempFiles([fileListPath, archivePath]);
 
-      if (!uploadResult.success) {
-        const errorMsg = `Failed to upload archive: ${uploadResult.error?.message || 'Unknown error'}`;
-        yield createProgressEvent(
-          'error',
-          'error',
-          errorMsg,
-          undefined,
-          errorMsg
-        );
-        return {
-          success: false,
-          error: errorMsg
-        };
-      }
-
-      if (uploadResult.data.exitCode !== 0) {
-        const errorMsg = `Failed to upload archive: ${sanitizeErrorOutput(uploadResult.data.stderr || 'Unknown error')}`;
+      if (uploadResult.exitCode !== 0) {
+        const errorMsg = `Failed to upload archive: ${sanitizeErrorOutput(uploadResult.stderr || 'Unknown error')}`;
         yield createProgressEvent(
           'error',
           'error',
@@ -1267,7 +1120,7 @@ export class SnapshotService {
       }
 
       // Check HTTP status code
-      const httpStatus = uploadResult.data.stdout.trim().slice(-3);
+      const httpStatus = uploadResult.stdout.trim().slice(-3);
       if (!httpStatus.startsWith('2')) {
         const errorMsg = `Upload failed with HTTP status ${httpStatus}`;
         yield createProgressEvent(

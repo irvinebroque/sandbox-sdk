@@ -36,7 +36,9 @@ export class HttpTransport extends BaseTransport {
     options?: RequestInit
   ): Promise<Response> {
     const url = this.buildUrl(path);
+    const timeoutMs = this.config.requestTimeoutMs ?? 120000;
 
+    // For stub case, delegate to containerFetch which has its own timeout handling
     if (this.config.stub) {
       return this.config.stub.containerFetch(
         url,
@@ -44,7 +46,25 @@ export class HttpTransport extends BaseTransport {
         this.config.port
       );
     }
-    return globalThis.fetch(url, options);
+
+    // Set up abort controller with timeout for real fetch
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await globalThis.fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+    } catch (error) {
+      // Convert AbortError to a more descriptive timeout error
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Request timeout after ${timeoutMs}ms: ${path}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   async fetchStream(
@@ -54,6 +74,12 @@ export class HttpTransport extends BaseTransport {
   ): Promise<ReadableStream<Uint8Array>> {
     const url = this.buildUrl(path);
     const options = this.buildStreamOptions(body, method);
+    const startTime = Date.now();
+
+    // Debug log stream request start
+    if (this.debug) {
+      this.logger.debug(`HTTP ${method} ${path} stream started`);
+    }
 
     let response: Response;
     if (this.config.stub) {
@@ -68,11 +94,28 @@ export class HttpTransport extends BaseTransport {
 
     if (!response.ok) {
       const errorBody = await response.text();
+
+      // Debug log stream error
+      if (this.debug) {
+        const duration = Date.now() - startTime;
+        this.logger.debug(
+          `HTTP ${method} ${path} stream failed (${duration}ms) status=${response.status}`
+        );
+      }
+
       throw new Error(`HTTP error! status: ${response.status} - ${errorBody}`);
     }
 
     if (!response.body) {
       throw new Error('No response body for streaming');
+    }
+
+    // Debug log stream response
+    if (this.debug) {
+      const duration = Date.now() - startTime;
+      this.logger.debug(
+        `HTTP ${method} ${path} stream connected (${duration}ms) status=${response.status}`
+      );
     }
 
     return response.body;

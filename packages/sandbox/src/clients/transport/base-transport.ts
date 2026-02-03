@@ -7,6 +7,7 @@ import type { ITransport, TransportConfig, TransportMode } from './types';
  */
 const TIMEOUT_MS = 120_000; // 2 minutes total retry budget
 const MIN_TIME_FOR_RETRY_MS = 15_000; // Need at least 15s remaining to retry
+const MAX_RETRIES = 10; // Maximum retry attempts
 
 /**
  * Abstract base transport with shared retry logic
@@ -17,10 +18,12 @@ const MIN_TIME_FOR_RETRY_MS = 15_000; // Need at least 15s remaining to retry
 export abstract class BaseTransport implements ITransport {
   protected config: TransportConfig;
   protected logger: Logger;
+  protected debug: boolean;
 
   constructor(config: TransportConfig) {
     this.config = config;
     this.logger = config.logger ?? createNoOpLogger();
+    this.debug = config.debug ?? false;
   }
 
   abstract getMode(): TransportMode;
@@ -37,6 +40,7 @@ export abstract class BaseTransport implements ITransport {
   async fetch(path: string, options?: RequestInit): Promise<Response> {
     const startTime = Date.now();
     let attempt = 0;
+    const method = options?.method ?? 'GET';
 
     while (true) {
       const response = await this.doFetch(path, options);
@@ -46,20 +50,34 @@ export abstract class BaseTransport implements ITransport {
         const elapsed = Date.now() - startTime;
         const remaining = TIMEOUT_MS - elapsed;
 
-        if (remaining > MIN_TIME_FOR_RETRY_MS) {
+        if (remaining > MIN_TIME_FOR_RETRY_MS && attempt < MAX_RETRIES) {
           const delay = Math.min(3000 * 2 ** attempt, 30000);
+          attempt++;
+
+          // Debug log for retry attempts
+          if (this.debug) {
+            this.logger.debug(
+              `HTTP ${method} ${path} retry ${attempt}/${MAX_RETRIES} after 503 (container starting)`
+            );
+          }
 
           this.logger.info('Container not ready, retrying', {
             status: response.status,
-            attempt: attempt + 1,
+            attempt,
             delayMs: delay,
             remainingSec: Math.floor(remaining / 1000),
             mode: this.getMode()
           });
 
           await this.sleep(delay);
-          attempt++;
           continue;
+        }
+
+        // Debug log when retries exhausted
+        if (this.debug) {
+          this.logger.debug(
+            `HTTP ${method} ${path} retries exhausted after ${attempt} attempts`
+          );
         }
 
         this.logger.error(

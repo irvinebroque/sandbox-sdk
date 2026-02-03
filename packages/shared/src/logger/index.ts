@@ -65,6 +65,8 @@ export function createNoOpLogger(): Logger {
  *
  * @param context Base context for the logger. Must include 'component'.
  *                TraceId will be auto-generated if not provided.
+ * @param minLevelOverride Optional log level override. When provided, this takes
+ *                         precedence over the SANDBOX_LOG_LEVEL environment variable.
  * @returns New logger instance
  *
  * @example
@@ -82,12 +84,19 @@ export function createNoOpLogger(): Logger {
  *   traceId: TraceContext.fromHeaders(request.headers)!,
  *   sessionId: this.id
  * });
+ *
+ * // With explicit debug level (ignores SANDBOX_LOG_LEVEL env var)
+ * const debugLogger = createLogger(
+ *   { component: 'sandbox-do' },
+ *   LogLevel.DEBUG
+ * );
  * ```
  */
 export function createLogger(
-  context: Partial<LogContext> & { component: LogComponent }
+  context: Partial<LogContext> & { component: LogComponent },
+  minLevelOverride?: LogLevel
 ): Logger {
-  const minLevel = getLogLevelFromEnv();
+  const minLevel = minLevelOverride ?? getLogLevelFromEnv();
   const pretty = isPrettyPrintEnabled();
 
   const baseContext: LogContext = {

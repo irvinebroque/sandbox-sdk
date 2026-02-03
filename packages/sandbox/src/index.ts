@@ -23,7 +23,6 @@ export {
 
 // Legacy types are now imported from the new client architecture
 
-// Export logger infrastructure
 // Export core SDK types for consumers
 export type {
   BaseExecOptions,
@@ -42,10 +41,7 @@ export type {
   GitCheckoutResult,
   ISandbox,
   ListFilesOptions,
-  LogContext,
   LogEvent,
-  Logger,
-  LogLevel,
   MountBucketOptions,
   Process,
   ProcessOptions,
@@ -64,15 +60,7 @@ export type {
   WaitForPortOptions
 } from '@repo/shared';
 // Export type guards for runtime validation
-export {
-  createLogger,
-  createNoOpLogger,
-  isExecResult,
-  isProcess,
-  isProcessStatus,
-  LogLevelEnum,
-  TraceContext
-} from '@repo/shared';
+export { isExecResult, isProcess, isProcessStatus } from '@repo/shared';
 // Export all client types from new architecture
 export type {
   BaseApiResponse,

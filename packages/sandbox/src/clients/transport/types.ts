@@ -19,6 +19,13 @@ export interface TransportConfig {
   /** Logger instance */
   logger?: Logger;
 
+  /**
+   * Enable verbose debug logging for request/response details.
+   * When true, logs method, path, timing, and retry attempts at DEBUG level.
+   * @default false
+   */
+  debug?: boolean;
+
   /** Container stub for DO-internal requests */
   stub?: ContainerStub;
 

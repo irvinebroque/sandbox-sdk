@@ -307,6 +307,14 @@ export function setupRoutes(router: Router, container: Container): void {
     middleware: [container.get('loggingMiddleware')]
   });
 
+  router.register({
+    method: 'POST',
+    path: '/api/snapshot/lockfile',
+    handler: async (req, ctx) =>
+      container.get('snapshotHandler').handle(req, ctx),
+    middleware: [container.get('loggingMiddleware')]
+  });
+
   // Miscellaneous routes
   router.register({
     method: 'GET',

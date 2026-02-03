@@ -36,6 +36,7 @@ import {
   filterEnvVars,
   getEnvString,
   isTerminalStatus,
+  LogLevelEnum,
   partitionEnvVars,
   type SessionDeleteResult,
   shellEscape,
@@ -128,6 +129,10 @@ export function getSandbox<T extends Sandbox<any>>(
     stub.setContainerTimeouts(options.containerTimeouts);
   }
 
+  if (options?.debug !== undefined) {
+    stub.setDebug(options.debug);
+  }
+
   return Object.assign(stub, {
     wsConnect: connect(stub)
   }) as T;
@@ -163,6 +168,8 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   private activeMounts: Map<string, MountInfo> = new Map();
   private transport: 'http' | 'websocket' = 'http';
   private autoSnapshotInProgress = false;
+  private autoRestoreInProgress = false;
+  private debugEnabled: boolean = false;
 
   /**
    * Last restored cache key for content-addressed skip-if-restored optimization
@@ -196,11 +203,21 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   private containerTimeouts = { ...this.DEFAULT_CONTAINER_TIMEOUTS };
 
   /**
-   * Create a SandboxClient with current transport settings
+   * Create a SandboxClient with current transport and debug settings
    */
   private createSandboxClient(): SandboxClient {
+    // When debug is enabled, create a debug-level logger for the client
+    // This ensures debug logs are visible without needing SANDBOX_LOG_LEVEL env var
+    const clientLogger = this.debugEnabled
+      ? createLogger(
+          { component: 'sandbox-do', sandboxId: this.ctx.id.toString() },
+          LogLevelEnum.DEBUG
+        )
+      : this.logger;
+
     return new SandboxClient({
-      logger: this.logger,
+      logger: clientLogger,
+      debug: this.debugEnabled,
       port: 3000,
       stub: this,
       ...(this.transport === 'websocket' && {
@@ -307,6 +324,14 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   async setKeepAlive(keepAlive: boolean): Promise<void> {
     this.keepAliveEnabled = keepAlive;
     await this.ctx.storage.put('keepAliveEnabled', keepAlive);
+  }
+
+  // RPC method to enable debug mode for verbose SDK logging
+  async setDebug(debug: boolean): Promise<void> {
+    this.debugEnabled = debug;
+    // Recreate client with updated debug setting (logger stays the same,
+    // but debug flag controls whether debug logs are emitted)
+    this.client = this.createSandboxClient();
   }
 
   async setEnvVars(envVars: Record<string, string | undefined>): Promise<void> {
@@ -791,18 +816,28 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     });
 
     // Auto-restore snapshot on wake if enabled
-    // Use blockConcurrencyWhile to prevent user requests during restore
-    this.ctx.blockConcurrencyWhile(async () => {
-      try {
-        await this.maybeAutoRestore();
-      } catch (error) {
-        this.logger.error(
-          'Auto-restore failed on wake',
-          error instanceof Error ? error : new Error(String(error))
-        );
-        // Don't re-throw - allow container to start even if restore fails
-      }
-    });
+    // Non-blocking: requests may arrive before restore completes, but this is
+    // preferable to blocking all requests if restore is slow or hangs.
+    // The autoRestoreInProgress flag allows callers to check restore status if needed.
+    if (!this.autoRestoreInProgress) {
+      this.autoRestoreInProgress = true;
+      this.logger.debug('Starting auto-restore check');
+
+      this.maybeAutoRestore()
+        .then(() => {
+          this.logger.debug('Auto-restore check completed');
+        })
+        .catch((error) => {
+          this.logger.error(
+            'Auto-restore failed on wake',
+            error instanceof Error ? error : new Error(String(error))
+          );
+          // Don't re-throw - allow container to continue even if restore fails
+        })
+        .finally(() => {
+          this.autoRestoreInProgress = false;
+        });
+    }
   }
 
   /**
@@ -894,22 +929,59 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
     // If container not healthy, start it with production timeouts
     if (state.status !== 'healthy') {
-      try {
-        this.logger.debug('Starting container with configured timeouts', {
-          instanceTimeout: this.containerTimeouts.instanceGetTimeoutMS,
-          portTimeout: this.containerTimeouts.portReadyTimeoutMS
-        });
+      // Log at info level so it appears in wrangler tail
+      this.logger.info('Starting container', {
+        instanceTimeout: this.containerTimeouts.instanceGetTimeoutMS,
+        portTimeout: this.containerTimeouts.portReadyTimeoutMS
+      });
 
-        await this.startAndWaitForPorts({
-          ports: port,
-          cancellationOptions: {
-            instanceGetTimeoutMS: this.containerTimeouts.instanceGetTimeoutMS,
-            portReadyTimeoutMS: this.containerTimeouts.portReadyTimeoutMS,
-            waitInterval: this.containerTimeouts.waitIntervalMS,
-            abort: request.signal
-          }
-        });
+      // Calculate total timeout with buffer for overhead
+      const totalTimeoutMs =
+        this.containerTimeouts.instanceGetTimeoutMS +
+        this.containerTimeouts.portReadyTimeoutMS +
+        5000; // 5s buffer
+
+      // Create timeout promise to guarantee we fail within a reasonable time
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(
+            new Error(`Container startup timed out after ${totalTimeoutMs}ms`)
+          );
+        }, totalTimeoutMs);
+      });
+
+      try {
+        // Race against timeout in case parent class doesn't respect our timeouts
+        await Promise.race([
+          this.startAndWaitForPorts({
+            ports: port,
+            cancellationOptions: {
+              instanceGetTimeoutMS: this.containerTimeouts.instanceGetTimeoutMS,
+              portReadyTimeoutMS: this.containerTimeouts.portReadyTimeoutMS,
+              waitInterval: this.containerTimeouts.waitIntervalMS,
+              abort: request.signal
+            }
+          }),
+          timeoutPromise
+        ]);
       } catch (e) {
+        // 0. Explicit timeout: Our timeout promise rejected
+        if (
+          e instanceof Error &&
+          e.message.includes('Container startup timed out')
+        ) {
+          this.logger.error('Container startup timed out', undefined, {
+            timeoutMs: totalTimeoutMs
+          });
+          return new Response(
+            `Container startup timed out after ${totalTimeoutMs}ms. The container may be experiencing issues.`,
+            {
+              status: 503,
+              headers: { 'Retry-After': '10' }
+            }
+          );
+        }
+
         // 1. Provisioning: Container VM not yet available
         if (this.isNoInstanceError(e)) {
           return new Response(
@@ -2900,20 +2972,18 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     try {
       // Use explicit lockfile path if configured
       if (config.lockfilePath) {
-        const result = await this.readFile(config.lockfilePath);
-        if (
-          result.success &&
-          result.content &&
-          result.content.trim().length > 0
-        ) {
+        // Use session-free lockfile read to avoid lock contention
+        const result = await this.client.snapshots.readLockfile(
+          config.lockfilePath
+        );
+        if (result.success && result.content && result.content.trim().length) {
           return generateCacheKey(result.content);
         }
         return null;
       }
 
-      // Auto-detect lockfile in volume path
-      const lockfileResult = await generateLockfileCacheKey(
-        this,
+      // Auto-detect lockfile in volume path using session-free reads
+      const lockfileResult = await this.detectLockfileSessionFree(
         config.volumePath
       );
       if (lockfileResult) {
@@ -2930,6 +3000,41 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       });
       return null;
     }
+  }
+
+  /**
+   * Detect lockfile using session-free reads to avoid lock contention.
+   * Tries common lockfile paths in priority order.
+   */
+  private async detectLockfileSessionFree(
+    cwd: string
+  ): Promise<{ cacheKey: string; lockfilePath: string } | null> {
+    const lockfiles = [
+      'package-lock.json',
+      'pnpm-lock.yaml',
+      'yarn.lock',
+      'bun.lock',
+      'bun.lockb'
+    ];
+
+    for (const lockfile of lockfiles) {
+      const path = cwd.endsWith('/')
+        ? `${cwd}${lockfile}`
+        : `${cwd}/${lockfile}`;
+
+      try {
+        const result = await this.client.snapshots.readLockfile(path);
+
+        if (result.success && result.content && result.content.trim().length) {
+          const cacheKey = await generateCacheKey(result.content);
+          return { cacheKey, lockfilePath: path };
+        }
+      } catch {
+        // Lockfile doesn't exist or can't be read - continue to next type
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -3510,6 +3615,8 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
    * to avoid blocking container startup.
    */
   private async maybeAutoRestore(): Promise<void> {
+    const AUTO_RESTORE_TIMEOUT_MS = 90_000;
+
     const config = await this.getSnapshotConfig();
     if (!config?.enabled || !config.autoRestoreOnWake) {
       return;
@@ -3527,20 +3634,37 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       snapshotId: latest.id
     });
 
-    // Prefer CDN cache if configured, otherwise use R2 presigned URL
-    if (this.shouldUseCachedUrl(config, latest)) {
-      await this.restoreSnapshotFromCache(latest.id);
-    } else {
-      const creds = await this.getR2Credentials();
-      if (!creds) {
-        this.logger.warn(
-          'Auto-restore enabled but no R2 credentials or CDN cache configured'
-        );
-        return;
-      }
+    // Wrap restore operation in a timeout to avoid blocking container startup
+    const restorePromise = (async () => {
+      // Prefer CDN cache if configured, otherwise use R2 presigned URL
+      if (this.shouldUseCachedUrl(config, latest)) {
+        await this.restoreSnapshotFromCache(latest.id);
+      } else {
+        const creds = await this.getR2Credentials();
+        if (!creds) {
+          this.logger.warn(
+            'Auto-restore enabled but no R2 credentials or CDN cache configured'
+          );
+          return;
+        }
 
-      const downloadUrl = await generatePresignedGetUrl(creds, latest.r2Key);
-      await this.restoreSnapshot(downloadUrl, latest.id);
+        const downloadUrl = await generatePresignedGetUrl(creds, latest.r2Key);
+        await this.restoreSnapshot(downloadUrl, latest.id);
+      }
+    })();
+
+    const timeoutPromise = new Promise<'timeout'>((resolve) =>
+      setTimeout(() => resolve('timeout'), AUTO_RESTORE_TIMEOUT_MS)
+    );
+
+    const result = await Promise.race([restorePromise, timeoutPromise]);
+
+    if (result === 'timeout') {
+      this.logger.warn('Auto-restore timed out, continuing without restore', {
+        snapshotId: latest.id,
+        timeoutMs: AUTO_RESTORE_TIMEOUT_MS
+      });
+      return;
     }
 
     this.logger.info('Auto-restore completed', { snapshotId: latest.id });

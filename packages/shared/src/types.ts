@@ -420,6 +420,19 @@ export interface SessionOptions {
 // Sandbox configuration options
 export interface SandboxOptions {
   /**
+   * Enable verbose SDK debug logging
+   *
+   * When enabled, logs detailed request/response information at DEBUG level,
+   * including HTTP methods, paths, timing, and retry attempts.
+   * Useful for debugging issues like hanging requests.
+   *
+   * Logs are visible via `wrangler tail` when SANDBOX_LOG_LEVEL=debug.
+   *
+   * @default false
+   */
+  debug?: boolean;
+
+  /**
    * Duration after which the sandbox instance will sleep if no requests are received
    * Can be:
    * - A string like "30s", "3m", "5m", "1h" (seconds, minutes, or hours)

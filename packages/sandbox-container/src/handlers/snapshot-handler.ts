@@ -42,6 +42,8 @@ export class SnapshotHandler extends BaseHandler<Request, Response> {
         return await this.handleRestore(request, context);
       case '/api/snapshot/manifest':
         return await this.handleGetManifest(request, context);
+      case '/api/snapshot/lockfile':
+        return await this.handleReadLockfile(request, context);
       default:
         return this.createErrorResponse(
           {
@@ -399,6 +401,65 @@ export class SnapshotHandler extends BaseHandler<Request, Response> {
         {
           message:
             error instanceof Error ? error.message : 'Get manifest failed',
+          code: ErrorCode.INTERNAL_ERROR
+        },
+        context
+      );
+    }
+  }
+
+  /**
+   * Read a lockfile directly without session locking.
+   * Used for content-addressed cache key computation.
+   * This bypasses the session system to avoid lock contention.
+   */
+  private async handleReadLockfile(
+    request: Request,
+    context: RequestContext
+  ): Promise<Response> {
+    const requestLogger = this.createRequestLogger(
+      request,
+      'snapshot.lockfile'
+    );
+
+    try {
+      const body = await this.parseRequestBody<{ path: string }>(request);
+
+      if (!body.path) {
+        return this.createErrorResponse(
+          {
+            message: 'path is required',
+            code: ErrorCode.VALIDATION_FAILED
+          },
+          context
+        );
+      }
+
+      requestLogger.debug('Reading lockfile', { path: body.path });
+
+      // Direct file read - no session locking
+      const file = Bun.file(body.path);
+      const exists = await file.exists();
+
+      if (!exists) {
+        return this.createTypedResponse(
+          { success: false, content: null },
+          context
+        );
+      }
+
+      const content = await file.text();
+      return this.createTypedResponse({ success: true, content }, context);
+    } catch (error) {
+      requestLogger.error(
+        'Read lockfile failed',
+        error instanceof Error ? error : undefined
+      );
+
+      return this.createErrorResponse(
+        {
+          message:
+            error instanceof Error ? error.message : 'Read lockfile failed',
           code: ErrorCode.INTERNAL_ERROR
         },
         context

@@ -21,10 +21,12 @@ export abstract class BaseHttpClient {
   protected options: HttpClientOptions;
   protected logger: Logger;
   protected transport: ITransport;
+  protected debug: boolean;
 
   constructor(options: HttpClientOptions = {}) {
     this.options = options;
     this.logger = options.logger ?? createNoOpLogger();
+    this.debug = options.debug ?? false;
 
     // Always create a Transport - it handles both HTTP and WebSocket modes
     if (options.transport) {
@@ -36,6 +38,7 @@ export abstract class BaseHttpClient {
         baseUrl: options.baseUrl ?? 'http://localhost:3000',
         wsUrl: options.wsUrl,
         logger: this.logger,
+        debug: this.debug,
         stub: options.stub,
         port: options.port
       });
@@ -50,13 +53,44 @@ export abstract class BaseHttpClient {
   }
 
   /**
+   * Truncate body for debug logging (avoid log spam)
+   */
+  private truncateBody(body: unknown, maxLength = 200): string {
+    if (body === undefined || body === null) return '';
+    const str = typeof body === 'string' ? body : JSON.stringify(body);
+    if (str.length <= maxLength) return str;
+    return `${str.substring(0, maxLength)}...`;
+  }
+
+  /**
    * Core fetch method - delegates to Transport which handles retry logic
    */
   protected async doFetch(
     path: string,
     options?: RequestInit
   ): Promise<Response> {
-    return this.transport.fetch(path, options);
+    const method = options?.method ?? 'GET';
+    const startTime = Date.now();
+
+    // Debug log request start
+    if (this.debug) {
+      this.logger.debug(`HTTP ${method} ${path} started`);
+      if (options?.body) {
+        this.logger.debug(`  body: ${this.truncateBody(options.body)}`);
+      }
+    }
+
+    const response = await this.transport.fetch(path, options);
+
+    // Debug log response
+    if (this.debug) {
+      const duration = Date.now() - startTime;
+      this.logger.debug(
+        `HTTP ${method} ${path} completed (${duration}ms) status=${response.status}`
+      );
+    }
+
+    return response;
   }
 
   /**
@@ -155,6 +189,11 @@ export abstract class BaseHttpClient {
         httpStatus: response.status,
         timestamp: new Date().toISOString()
       };
+    }
+
+    // Debug log full error details
+    if (this.debug) {
+      this.logger.debug(`HTTP error response: ${JSON.stringify(errorData)}`);
     }
 
     // Convert ErrorResponse to appropriate Error class

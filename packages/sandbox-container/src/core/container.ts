@@ -118,11 +118,7 @@ export class Container {
       sessionManager
     );
     const interpreterService = new InterpreterService(logger);
-    const snapshotService = new SnapshotService(
-      sessionManager,
-      securityAdapter,
-      logger
-    );
+    const snapshotService = new SnapshotService(securityAdapter, logger);
     const r2UploadService = new R2UploadService(sessionManager, logger);
 
     // Initialize handlers

@@ -23,6 +23,7 @@ export {
 
 // Legacy types are now imported from the new client architecture
 
+// Export logger infrastructure
 // Export core SDK types for consumers
 export type {
   BaseExecOptions,
@@ -41,11 +42,16 @@ export type {
   GitCheckoutResult,
   ISandbox,
   ListFilesOptions,
+  LogContext,
   LogEvent,
+  Logger,
+  LogLevel,
   MountBucketOptions,
   Process,
   ProcessOptions,
   ProcessStatus,
+  // R2 credential config for presigned URL generation
+  R2CredentialConfig,
   RunCodeOptions,
   SandboxOptions,
   SessionOptions,
@@ -58,7 +64,15 @@ export type {
   WaitForPortOptions
 } from '@repo/shared';
 // Export type guards for runtime validation
-export { isExecResult, isProcess, isProcessStatus } from '@repo/shared';
+export {
+  createLogger,
+  createNoOpLogger,
+  isExecResult,
+  isProcess,
+  isProcessStatus,
+  LogLevelEnum,
+  TraceContext
+} from '@repo/shared';
 // Export all client types from new architecture
 export type {
   BaseApiResponse,
@@ -151,3 +165,8 @@ export {
   isSignedUrlExpired,
   parseSignedCacheUrl
 } from './utils/cache-signing';
+// Export presigned URL generation for R2 (no AWS SDK required)
+export {
+  generatePresignedGetUrl,
+  generatePresignedPutUrl
+} from './utils/s3-presign';

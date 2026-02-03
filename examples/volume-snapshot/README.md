@@ -6,6 +6,8 @@ This example demonstrates how to use **volume snapshots** to persist container s
 2. **Installing npm dependencies** (`node_modules`)
 3. **Creating a snapshot** of the workspace
 4. **Restoring from the snapshot** on subsequent sandbox starts
+5. **Tracking persistent state** that proves restoration works (visit counter, timing)
+6. **Force sleep** to trigger snapshot and test restoration
 
 ## Why Use Volume Snapshots?
 
@@ -20,6 +22,29 @@ With snapshots:
 - Subsequent runs: Restore from snapshot (~10-30 seconds)
 
 The snapshot includes everything in `/workspace`, so your git repo, node_modules, and any other files are instantly available.
+
+## Demo Features
+
+### Visit Counter (Proves Persistence)
+
+The demo tracks a visit counter in `/workspace/.sandbox-state.json`. Each time you click "Run Setup", the counter increments. When you Force Sleep and wake the sandbox, the counter persists - proving the snapshot/restore cycle preserved your state.
+
+### Timing Comparison
+
+The UI shows:
+
+- **Fresh setup time**: How long the initial clone + npm install took
+- **Last restore time**: How fast the snapshot restored
+- **Speedup**: The multiplier showing how much faster restore is (typically 5-10x)
+
+### Force Sleep Button
+
+Click "Force Sleep" to:
+
+1. Trigger an auto-snapshot (saves current state to R2)
+2. Put the sandbox to sleep
+
+Then click "Run Setup" to wake it and see the fast restore in action.
 
 ## Prerequisites
 
@@ -57,10 +82,10 @@ cp .dev.vars.example .dev.vars
 Edit `.dev.vars`:
 
 ```bash
+CF_ACCOUNT_ID=your-cloudflare-account-id
+R2_BUCKET_NAME=sandbox-snapshots
 R2_ACCESS_KEY_ID=your-access-key-id
 R2_SECRET_ACCESS_KEY=your-secret-access-key
-R2_ENDPOINT=https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com
-R2_BUCKET_NAME=sandbox-snapshots
 ```
 
 > **Note**: Get your Account ID from the Cloudflare Dashboard URL or R2 settings page.
@@ -85,7 +110,7 @@ Visit `http://localhost:8787/setup`
 
 This will:
 
-1. Clone the [Astro Blog Starter Template](https://github.com/cloudflare/templates/tree/main/astro-blog-starter-template)
+1. Clone the [Astro Blog Starter Template](https://github.com/irvinebroque/astro-blog-starter-template)
 2. Install npm dependencies
 3. Create a snapshot of the workspace
 
@@ -124,11 +149,12 @@ Runs `npm run build` to verify the project is fully functional.
 
 | Endpoint    | Method | Description                                        |
 | ----------- | ------ | -------------------------------------------------- |
-| `/`         | GET    | Show usage information                             |
+| `/`         | GET    | Show the interactive UI                            |
 | `/setup`    | GET    | Clone repo + install deps OR restore from snapshot |
-| `/status`   | GET    | Check if files exist                               |
+| `/status`   | GET    | Check file status and persistent state             |
+| `/sleep`    | POST   | Force sandbox to sleep (triggers auto-snapshot)    |
 | `/snapshot` | POST   | Manually create a new snapshot                     |
-| `/snapshot` | DELETE | Delete the snapshot                                |
+| `/snapshot` | DELETE | Delete the snapshot (for reset)                    |
 | `/restore`  | POST   | Manually restore from snapshot                     |
 | `/run`      | GET    | Run `npm build` to verify project                  |
 
@@ -176,10 +202,10 @@ await sandbox.configureSnapshots({
 1. Set secrets for production:
 
 ```bash
+npx wrangler secret put CF_ACCOUNT_ID
+npx wrangler secret put R2_BUCKET_NAME
 npx wrangler secret put R2_ACCESS_KEY_ID
 npx wrangler secret put R2_SECRET_ACCESS_KEY
-npx wrangler secret put R2_ENDPOINT
-npx wrangler secret put R2_BUCKET_NAME
 ```
 
 2. Deploy:
@@ -207,4 +233,3 @@ First container start after deployment can take 1-2 minutes for provisioning. Su
 
 - [Sandbox SDK Documentation](https://developers.cloudflare.com/sandbox/)
 - [R2 Presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/)
-- [Volume Snapshots PR](https://github.com/irvinebroque/sandbox-sdk/pull/1)

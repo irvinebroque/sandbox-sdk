@@ -129,24 +129,18 @@ const result = await sandbox.restoreSnapshotFromCache('snap-123', {
 
 ### Bypassing the Cache
 
-The existing `restoreSnapshot()` method always uses the provided URL directly:
+To bypass the CDN cache, use `restoreSnapshot()` directly with a presigned URL instead of `restoreSnapshotFromCache()`:
 
 ```typescript
-// Always uses presigned URL (no cache)
-const presignedUrl = await getPresignedUrl(bucket, key);
-const result = await sandbox.restoreSnapshot(presignedUrl, 'snap-123');
+// Use presigned URL directly (bypasses cache)
+import { generatePresignedGetUrl } from '@cloudflare/sandbox';
+
+const metadata = await sandbox.getSnapshotMetadata('snap-123');
+const presignedUrl = await generatePresignedGetUrl(credentials, metadata.r2Key);
+await sandbox.restoreSnapshot(presignedUrl, metadata.id);
 ```
 
-If you have cache configured but want to bypass it for a specific restore:
-
-```typescript
-// This will throw an error - use restoreSnapshot() instead
-await sandbox.restoreSnapshotFromCache('snap-123', { bypassCache: true });
-
-// Correct way to bypass cache
-const presignedUrl = await getPresignedUrl(bucket, key);
-await sandbox.restoreSnapshot(presignedUrl, 'snap-123');
-```
+The `restoreSnapshotFromCache()` method is designed exclusively for CDN-cached restores and does not support bypassing the cache. When you need to skip the cache (for debugging or when the cache is unavailable), use `restoreSnapshot()` with a presigned URL as shown above.
 
 ### Automatic Fallback for Large Files
 
@@ -160,7 +154,10 @@ const config = await sandbox.getSnapshotConfig();
 
 if (metadata.sizeBytes > (config.cacheSizeLimit ?? 536870912)) {
   // Large file - use presigned URL
-  const presignedUrl = await getPresignedUrl(bucket, metadata.r2Key);
+  const presignedUrl = await generatePresignedGetUrl(
+    credentials,
+    metadata.r2Key
+  );
   await sandbox.restoreSnapshot(presignedUrl, metadata.id);
 } else {
   // Use cache

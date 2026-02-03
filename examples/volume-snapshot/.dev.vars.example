@@ -11,8 +11,7 @@
 #
 # Copy this file to .dev.vars and fill in your values
 
+CF_ACCOUNT_ID=your-cloudflare-account-id
+R2_BUCKET_NAME=sandbox-snapshots
 R2_ACCESS_KEY_ID=your-access-key-id
 R2_SECRET_ACCESS_KEY=your-secret-access-key
-R2_ENDPOINT=https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com
-R2_BUCKET_NAME=sandbox-snapshots
-CF_ACCOUNT_ID=your-cloudflare-account-id

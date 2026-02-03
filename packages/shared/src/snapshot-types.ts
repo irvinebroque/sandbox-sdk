@@ -338,6 +338,8 @@ export interface GetManifestRequest {
   volumePath: string;
   /** Glob patterns for files to exclude */
   excludePatterns: string[];
+  /** Skip computing SHA256 hashes for files (faster manifest generation) */
+  skipFileHashes?: boolean;
 }
 
 /**

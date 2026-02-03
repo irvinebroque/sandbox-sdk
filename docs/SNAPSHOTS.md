@@ -57,6 +57,8 @@ await sandbox.configureSnapshots({
 });
 ```
 
+**Note:** Steps 3 and 4 below show manual snapshot creation. For most use cases, the recommended approach is automatic snapshots (see [Auto-Snapshot](#auto-snapshot-recommended) below).
+
 ### 3. Create a Snapshot (Manual)
 
 For manual snapshot control, generate a presigned URL and create the snapshot:
@@ -218,6 +220,8 @@ const result = await sandbox.restoreSnapshotFromCache('snap-123');
 | `cacheHmacSecret`         | `string`                        | -            | HMAC secret fallback (prefer env var)                   |
 | `cacheUrlTtl`             | `number`                        | `3600`       | TTL for signed cache URLs (seconds)                     |
 | `cacheSizeLimit`          | `number`                        | `536870912`  | Max file size for cache (512 MB)                        |
+
+**Note:** `retentionDays` is deprecated. Use `defaultTtl` instead, which supports more flexible time formats like '30d', '1w', '1m', or 'forever'.
 
 ### R2CredentialConfig Options
 

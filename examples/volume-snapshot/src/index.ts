@@ -10,28 +10,49 @@
  */
 
 import {
-  GetObjectCommand,
-  PutObjectCommand,
-  S3Client
-} from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import {
+  createLogger,
+  generatePresignedGetUrl,
+  generatePresignedPutUrl,
   getSandbox,
+  type LogContext,
+  type Logger,
   parseSSEStream,
+  type R2CredentialConfig,
   type SnapshotProgressEvent
 } from '@cloudflare/sandbox';
 
 export { Sandbox } from '@cloudflare/sandbox';
 
-// Repository to clone - Cloudflare's Astro blog starter template
-const REPO_URL = 'https://github.com/cloudflare/templates.git';
-const REPO_SUBDIR = 'astro-blog-starter-template';
+// Repository to clone - Astro blog starter template
+const REPO_URL =
+  'https://github.com/irvinebroque/astro-blog-starter-template.git';
 const WORKSPACE = '/workspace';
-const PROJECT_DIR = `${WORKSPACE}/${REPO_SUBDIR}`;
+const PROJECT_DIR = `${WORKSPACE}/astro-blog-starter-template`;
+const STATE_FILE = `${WORKSPACE}/.sandbox-state.json`;
 
 // Snapshot configuration
 const SNAPSHOT_KEY_PREFIX = 'snapshots/';
 const PRESIGNED_URL_EXPIRY = 3600; // 1 hour
+
+/**
+ * Filter function to identify significant npm output lines.
+ * Reduces noise by only showing summary lines, warnings, errors, and progress milestones.
+ */
+function isSignificantNpmLine(line: string): boolean {
+  const lower = line.toLowerCase();
+  return (
+    lower.includes('added') ||
+    lower.includes('removed') ||
+    lower.includes('packages') ||
+    lower.includes('warn') ||
+    lower.includes('error') ||
+    lower.includes('npm err') ||
+    lower.includes('npm warn') ||
+    lower.includes('installing') ||
+    /^\d+\s+(packages|dependencies)/.test(line) ||
+    line.startsWith('>')
+  );
+}
 
 interface SnapshotMetadata {
   id: string;
@@ -42,41 +63,41 @@ interface SnapshotMetadata {
 }
 
 /**
- * Create an S3 client configured for Cloudflare R2
+ * Persistent state that survives snapshots, proving restoration works
  */
-function createR2Client(env: Env): S3Client {
-  return new S3Client({
-    region: 'auto',
-    endpoint: env.R2_ENDPOINT,
-    credentials: {
-      accessKeyId: env.R2_ACCESS_KEY_ID,
-      secretAccessKey: env.R2_SECRET_ACCESS_KEY
-    }
-  });
+interface SandboxState {
+  visitCount: number; // Increments every /setup call
+  firstVisitTime: number; // Timestamp of first ever visit
+  lastFreshSetupTime: number; // How long fresh setup took (ms)
+  lastRestoreTime: number; // How long restore took (ms)
+  snapshotCreatedAt: number; // When snapshot was created
+}
+
+/**
+ * Build R2 credential config from environment variables
+ */
+function getR2Credentials(env: Env): R2CredentialConfig {
+  return {
+    accountId: env.CF_ACCOUNT_ID,
+    bucketName: env.R2_BUCKET_NAME,
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    urlExpiry: PRESIGNED_URL_EXPIRY
+  };
 }
 
 /**
  * Generate a presigned URL for uploading to R2
  */
 async function getUploadUrl(env: Env, key: string): Promise<string> {
-  const client = createR2Client(env);
-  const command = new PutObjectCommand({
-    Bucket: env.R2_BUCKET_NAME,
-    Key: key
-  });
-  return getSignedUrl(client, command, { expiresIn: PRESIGNED_URL_EXPIRY });
+  return generatePresignedPutUrl(getR2Credentials(env), key);
 }
 
 /**
  * Generate a presigned URL for downloading from R2
  */
 async function getDownloadUrl(env: Env, key: string): Promise<string> {
-  const client = createR2Client(env);
-  const command = new GetObjectCommand({
-    Bucket: env.R2_BUCKET_NAME,
-    Key: key
-  });
-  return getSignedUrl(client, command, { expiresIn: PRESIGNED_URL_EXPIRY });
+  return generatePresignedGetUrl(getR2Credentials(env), key);
 }
 
 /**
@@ -87,11 +108,20 @@ interface SetupStepEvent {
   message: string;
 }
 
+interface SetupLogEvent {
+  type: 'log';
+  level: 'debug' | 'info' | 'warn' | 'error';
+  message: string;
+  timestamp: string;
+  elapsed: number; // ms since start
+}
+
 interface SetupCompleteEvent {
   type: 'complete';
   success: true;
   restored: boolean;
   duration: number;
+  state: SandboxState;
   stats?: {
     filesRestored?: number;
     totalFiles?: number;
@@ -104,15 +134,57 @@ interface SetupErrorEvent {
   message: string;
 }
 
-type SetupEvent = SetupStepEvent | SetupCompleteEvent | SetupErrorEvent;
+type SetupEvent =
+  | SetupStepEvent
+  | SetupLogEvent
+  | SetupCompleteEvent
+  | SetupErrorEvent;
+
+/**
+ * Read sandbox state from file (returns default state if not found)
+ */
+async function readSandboxState(
+  sandbox: ReturnType<typeof getSandbox>
+): Promise<SandboxState> {
+  try {
+    const result = await sandbox.exec(`cat ${STATE_FILE}`, { timeout: 5000 });
+    if (result.success && result.stdout.trim()) {
+      return JSON.parse(result.stdout.trim()) as SandboxState;
+    }
+  } catch {
+    // File doesn't exist or parse error
+  }
+  return {
+    visitCount: 0,
+    firstVisitTime: 0,
+    lastFreshSetupTime: 0,
+    lastRestoreTime: 0,
+    snapshotCreatedAt: 0
+  };
+}
+
+/**
+ * Write sandbox state to file
+ */
+async function writeSandboxState(
+  sandbox: ReturnType<typeof getSandbox>,
+  state: SandboxState
+): Promise<void> {
+  const json = JSON.stringify(state, null, 2);
+  // Use echo with proper escaping
+  await sandbox.exec(`cat > ${STATE_FILE} << 'EOFSTATE'\n${json}\nEOFSTATE`, {
+    timeout: 5000
+  });
+}
 
 /**
  * GET /setup - Clone repo, install deps, create snapshot (SSE streaming)
  *
  * This endpoint streams progress via Server-Sent Events:
- * 1. Checks if a snapshot exists and restores it if so
- * 2. Otherwise, clones the repo and installs npm dependencies
- * 3. Creates a snapshot for future use
+ * 1. Reads/updates persistent state (visit counter, timing)
+ * 2. Checks if a snapshot exists and restores it if so
+ * 3. Otherwise, clones the repo and installs npm dependencies
+ * 4. Creates a snapshot for future use (including state file)
  */
 function handleSetup(env: Env): Response {
   const encoder = new TextEncoder();
@@ -133,8 +205,26 @@ function handleSetup(env: Env): Response {
     const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo');
 
     try {
+      // Wake container and measure startup time
+      await sendStep('Waking container...');
+      const wakeStart = Date.now();
+      await sandbox.exec('echo ready', { timeout: 120000 });
+      const wakeTime = Date.now() - wakeStart;
+      await sendStep(`Container ready in ${wakeTime}ms`);
+
+      // Read existing state (may have been restored from snapshot)
+      let state = await readSandboxState(sandbox);
+      const isFirstEverVisit = state.visitCount === 0;
+
+      // Increment visit count
+      state.visitCount++;
+      if (isFirstEverVisit) {
+        state.firstVisitTime = Date.now();
+      }
+
+      await sendStep(`Visit #${state.visitCount} - checking for snapshot...`);
+
       // Check for existing snapshot
-      await sendStep('Checking for existing snapshot...');
       const existingSnapshot = await env.SNAPSHOTS.head(
         `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`
       );
@@ -153,8 +243,6 @@ function handleSetup(env: Env): Response {
         });
 
         // Configure R2 credentials for auto-snapshot/restore functionality
-        // This allows the sandbox to automatically create/restore snapshots
-        // when the container sleeps/wakes without manual intervention
         await sandbox.configureR2Credentials({
           accountId: env.CF_ACCOUNT_ID,
           bucketName: env.R2_BUCKET_NAME,
@@ -171,7 +259,13 @@ function handleSetup(env: Env): Response {
         const alreadyRestored = checkResult.stdout.trim() === 'exists';
 
         if (alreadyRestored) {
-          // Auto-restore already ran when container woke up - no need to manually restore
+          // Auto-restore already ran when container woke up
+          const duration = Date.now() - startTime;
+          state.lastRestoreTime = duration;
+
+          // Update state file
+          await writeSandboxState(sandbox, state);
+
           await sendStep(
             'Project directory exists (auto-restored on wake) - skipping manual restore'
           );
@@ -179,14 +273,15 @@ function handleSetup(env: Env): Response {
             type: 'complete',
             success: true,
             restored: true,
-            duration: Date.now() - startTime,
-            stats: { filesRestored: 0 } // Auto-restore already handled this
+            duration,
+            state,
+            stats: { filesRestored: 0 }
           });
           await writer.close();
           return;
         }
 
-        // Manual restore needed (e.g., first request after configuring auto-restore)
+        // Manual restore needed
         await sendStep('Found existing snapshot, restoring...');
         const downloadUrl = await getDownloadUrl(
           env,
@@ -198,19 +293,30 @@ function handleSetup(env: Env): Response {
         );
 
         if (restoreResult.success) {
+          const duration = Date.now() - startTime;
+
+          // Re-read state after restore (snapshot may contain updated state)
+          state = await readSandboxState(sandbox);
+          state.visitCount++;
+          if (state.firstVisitTime === 0) {
+            state.firstVisitTime = Date.now();
+          }
+          state.lastRestoreTime = duration;
+
+          // Update state file
+          await writeSandboxState(sandbox, state);
+
           await sendStep(
             `Restored ${restoreResult.stats.filesRestored} files in ${restoreResult.stats.duration}ms`
           );
-
-          // Verify restoration
-          await sandbox.exec(`ls -la ${PROJECT_DIR}`);
           await sendStep('Verified project directory exists');
 
           await sendEvent({
             type: 'complete',
             success: true,
             restored: true,
-            duration: Date.now() - startTime,
+            duration,
+            state,
             stats: { filesRestored: restoreResult.stats.filesRestored }
           });
           await writer.close();
@@ -247,40 +353,46 @@ function handleSetup(env: Env): Response {
       });
       await sendStep('Configured snapshot settings');
 
-      // Clone the repository with sparse checkout for just the template we need
+      // Clone the repository with streaming output
       await sendStep(`Cloning ${REPO_URL}...`);
       const cloneStart = Date.now();
 
-      // Use sparse checkout to only get the astro-blog-starter-template directory
       await sandbox.exec(
-        `git clone --filter=blob:none --sparse ${REPO_URL} templates-repo`,
+        `git clone --progress ${REPO_URL} astro-blog-starter-template`,
         {
           cwd: WORKSPACE,
-          timeout: 120000 // 2 minutes
+          timeout: 120000, // 2 minutes
+          stream: true,
+          onOutput: async (_stream, data) => {
+            // Git clone progress goes to stderr, forward non-empty lines
+            const lines = data.split('\n').filter((l) => l.trim());
+            for (const line of lines) {
+              await sendStep(`[git] ${line}`);
+            }
+          }
         }
       );
-
-      await sandbox.exec(
-        'git sparse-checkout set astro-blog-starter-template',
-        {
-          cwd: `${WORKSPACE}/templates-repo`
-        }
-      );
-
-      // Move the template to the workspace root
-      await sandbox.exec(`mv templates-repo/${REPO_SUBDIR} ${PROJECT_DIR}`);
-      await sandbox.exec('rm -rf templates-repo', { cwd: WORKSPACE });
 
       const cloneDuration = Date.now() - cloneStart;
       await sendStep(`Cloned repository in ${cloneDuration}ms`);
 
-      // Install npm dependencies
+      // Install npm dependencies with streaming output
       await sendStep('Installing npm dependencies...');
       const npmStart = Date.now();
 
       const npmResult = await sandbox.exec('npm install', {
         cwd: PROJECT_DIR,
-        timeout: 300000 // 5 minutes
+        timeout: 300000, // 5 minutes
+        stream: true,
+        onOutput: async (_stream, data) => {
+          // Filter to show only significant lines (summaries, warnings, errors)
+          const lines = data.split('\n').filter((l) => l.trim());
+          for (const line of lines) {
+            if (isSignificantNpmLine(line)) {
+              await sendStep(`[npm] ${line}`);
+            }
+          }
+        }
       });
 
       if (!npmResult.success) {
@@ -290,11 +402,22 @@ function handleSetup(env: Env): Response {
       const npmDuration = Date.now() - npmStart;
       await sendStep(`Installed dependencies in ${npmDuration}ms`);
 
+      // Update state before creating snapshot
+      const totalDuration = Date.now() - startTime;
+      state.lastFreshSetupTime = totalDuration;
+      state.snapshotCreatedAt = Date.now();
+
+      // Write state file so it's included in the snapshot
+      await sendStep('Writing sandbox state...');
+      await writeSandboxState(sandbox, state);
+      await sendStep('Saved sandbox state');
+
       // Create snapshot with streaming progress
       const snapshotStart = Date.now();
 
       const snapshotId = `snapshot-${Date.now()}`;
       const r2Key = `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`;
+      await sendStep('Generating upload URL...');
       const uploadUrl = await getUploadUrl(env, r2Key);
 
       // Use streaming API for real-time progress updates
@@ -303,6 +426,7 @@ function handleSetup(env: Env): Response {
         compressedBytes?: number;
       } = {};
 
+      await sendStep('Starting snapshot stream...');
       const snapshotStream = await sandbox.createSnapshotStream(uploadUrl);
       for await (const event of parseSSEStream<SnapshotProgressEvent>(
         snapshotStream
@@ -347,7 +471,8 @@ function handleSetup(env: Env): Response {
         type: 'complete',
         success: true,
         restored: false,
-        duration: Date.now() - startTime,
+        duration: totalDuration,
+        state,
         stats: {
           totalFiles: snapshotStats.totalFiles,
           compressedBytes: snapshotStats.compressedBytes
@@ -389,6 +514,9 @@ async function handleStatus(env: Env): Promise<Response> {
 
     const [packageJson, nodeModules, gitDir, nodeModulesCount] = checks;
 
+    // Read persistent state
+    const state = await readSandboxState(sandbox);
+
     // Get snapshot metadata if available
     const metadataObj = await env.SNAPSHOTS.get(
       `${SNAPSHOT_KEY_PREFIX}metadata.json`
@@ -403,6 +531,7 @@ async function handleStatus(env: Env): Promise<Response> {
     );
 
     return Response.json({
+      sandboxId: 'volume-snapshot-demo',
       projectDir: PROJECT_DIR,
       filesExist: {
         'package.json': packageJson.stdout.includes('exists'),
@@ -412,7 +541,8 @@ async function handleStatus(env: Env): Promise<Response> {
       nodeModulesPackageCount:
         parseInt(nodeModulesCount.stdout.trim(), 10) || 0,
       snapshotExists: !!snapshotExists,
-      snapshotMetadata: metadata
+      snapshotMetadata: metadata,
+      state
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -434,6 +564,8 @@ async function handleCreateSnapshot(env: Env): Promise<Response> {
       maxSnapshots: 5,
       compressionLevel: 'fast', // Uses optimized zstd --fast=1 -T4
       excludePatterns: [],
+      autoSnapshotOnSleep: false,
+      autoRestoreOnWake: false,
       useContentAddressedKeys: true // Enable skip-if-restored optimization
     });
 
@@ -474,7 +606,11 @@ async function handleCreateSnapshot(env: Env): Promise<Response> {
       success: true,
       skipped: false,
       duration,
-      stats: result.stats
+      stats: {
+        fileCount: result.fileCount,
+        sizeBytes: result.sizeBytes,
+        uncompressedBytes: result.uncompressedBytes
+      }
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -507,6 +643,8 @@ async function handleRestore(env: Env): Promise<Response> {
       maxSnapshots: 5,
       compressionLevel: 'fast', // Uses optimized zstd --fast=1 -T4
       excludePatterns: [],
+      autoSnapshotOnSleep: false,
+      autoRestoreOnWake: false,
       useContentAddressedKeys: true // Tracks cache key for skip-if-restored
     });
 
@@ -576,6 +714,34 @@ async function handleRun(env: Env): Promise<Response> {
 }
 
 /**
+ * POST /sleep - Force the sandbox to sleep
+ * Triggers auto-snapshot if configured, then puts the sandbox to sleep.
+ * Next request will wake and restore from snapshot.
+ */
+async function handleSleep(env: Env): Promise<Response> {
+  const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo');
+
+  try {
+    // Update state before sleeping so it's captured in the auto-snapshot
+    const state = await readSandboxState(sandbox);
+    await writeSandboxState(sandbox, state);
+
+    // Destroy triggers auto-snapshot if configured, then sleeps
+    await sandbox.destroy();
+
+    return Response.json({
+      success: true,
+      message:
+        'Sandbox is now sleeping. Next request will wake and restore from snapshot.',
+      visitCount: state.visitCount
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return Response.json({ success: false, error: message }, { status: 500 });
+  }
+}
+
+/**
  * Format bytes to human readable string
  */
 function formatBytes(bytes: number): string {
@@ -598,24 +764,49 @@ function getHtmlUI(): string {
   <title>Volume Snapshot Demo</title>
   <style>
     * { box-sizing: border-box; }
-    body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; background: #111; color: #eee; }
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; background: #111; color: #eee; }
     h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
     .subtitle { color: #888; margin-bottom: 1.5rem; }
+    
+    /* Header section with sandbox info */
+    .header-info { background: #1a1a2a; border: 1px solid #333; border-radius: 6px; padding: 1rem; margin-bottom: 1.5rem; }
+    .sandbox-id { font-family: monospace; font-size: 0.9rem; color: #88f; margin-bottom: 0.5rem; }
+    .visit-info { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: center; }
+    .visit-count { font-size: 1.5rem; font-weight: bold; color: #fff; }
+    .visit-meta { font-size: 0.85rem; color: #888; }
+    .status-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 0.85rem; font-weight: 500; }
+    .status-badge.restored { background: #1a4a1a; color: #6c6; border: 1px solid #2a6a2a; }
+    .status-badge.fresh { background: #4a3a1a; color: #ca6; border: 1px solid #6a5a2a; }
+    
+    /* Timing comparison */
+    .timing-compare { display: flex; gap: 1rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .timing-item { font-size: 0.85rem; padding: 0.25rem 0.5rem; background: #222; border-radius: 4px; }
+    .timing-item.highlight { background: #1a3a1a; color: #6c6; }
+    .timing-speedup { color: #6c6; font-weight: bold; }
+    
     .buttons { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
     button { padding: 0.5rem 1rem; border: 1px solid #444; background: #222; color: #eee; cursor: pointer; border-radius: 4px; }
     button:hover:not(:disabled) { background: #333; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.primary { background: #234; border-color: #345; }
+    button.primary:hover:not(:disabled) { background: #345; }
+    button.warning { border-color: #653; }
+    button.warning:hover:not(:disabled) { background: #432; }
     button.danger { border-color: #633; }
     button.danger:hover:not(:disabled) { background: #422; }
-    .log { background: #1a1a1a; border: 1px solid #333; padding: 1rem; min-height: 150px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.875rem; white-space: pre-wrap; margin-bottom: 1rem; }
+    
+    .log { background: #1a1a1a; border: 1px solid #333; padding: 1rem; min-height: 150px; max-height: 500px; overflow-y: auto; font-family: monospace; font-size: 0.875rem; white-space: pre-wrap; margin-bottom: 1rem; border-radius: 4px; }
     .log:empty::before { content: "Ready. Click 'Run Setup' to start."; color: #666; }
+    
     .timing { font-size: 1.25rem; margin-bottom: 1rem; padding: 0.75rem; background: #1a2a1a; border: 1px solid #2a4a2a; border-radius: 4px; }
     .timing.restored { background: #1a3a1a; border-color: #2a5a2a; }
     .timing.fresh { background: #2a2a1a; border-color: #4a4a2a; }
+    
     .status { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
     .status-item { padding: 0.25rem 0.5rem; background: #222; border-radius: 4px; }
     .status-item.ok { color: #6c6; }
     .status-item.missing { color: #c66; }
+    
     .hidden { display: none; }
     .error { color: #f66; }
     .success { color: #6c6; }
@@ -625,11 +816,22 @@ function getHtmlUI(): string {
   <h1>Volume Snapshot Demo</h1>
   <p class="subtitle">See how snapshots restore container state in seconds instead of minutes</p>
   
+  <div id="header-info" class="header-info hidden">
+    <div class="sandbox-id">Sandbox: <strong>volume-snapshot-demo</strong></div>
+    <div class="visit-info">
+      <span class="visit-count" id="visit-count">Visit #1</span>
+      <span id="status-badge" class="status-badge"></span>
+      <span class="visit-meta" id="first-visit"></span>
+    </div>
+    <div class="timing-compare" id="timing-compare"></div>
+  </div>
+  
   <div class="buttons">
-    <button id="btn-setup">Run Setup</button>
+    <button id="btn-setup" class="primary">Run Setup</button>
+    <button id="btn-sleep" class="warning">Force Sleep</button>
     <button id="btn-status">Check Status</button>
     <button id="btn-build">Run Build</button>
-    <button id="btn-reset" class="danger">Reset (Delete Snapshot)</button>
+    <button id="btn-reset" class="danger">Reset</button>
   </div>
   
   <div id="timing" class="timing hidden"></div>
@@ -642,7 +844,13 @@ function getHtmlUI(): string {
     const log = document.getElementById('log');
     const timing = document.getElementById('timing');
     const status = document.getElementById('status');
+    const headerInfo = document.getElementById('header-info');
+    const visitCountEl = document.getElementById('visit-count');
+    const statusBadge = document.getElementById('status-badge');
+    const firstVisitEl = document.getElementById('first-visit');
+    const timingCompare = document.getElementById('timing-compare');
     const btnSetup = document.getElementById('btn-setup');
+    const btnSleep = document.getElementById('btn-sleep');
     const btnStatus = document.getElementById('btn-status');
     const btnBuild = document.getElementById('btn-build');
     const btnReset = document.getElementById('btn-reset');
@@ -662,11 +870,69 @@ function getHtmlUI(): string {
     }
     
     function setButtons(enabled) {
-      [btnSetup, btnStatus, btnBuild, btnReset].forEach(b => b.disabled = !enabled);
+      [btnSetup, btnSleep, btnStatus, btnBuild, btnReset].forEach(b => b.disabled = !enabled);
     }
     
     function formatTime(ms) {
+      if (!ms || ms === 0) return '-';
       return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+    }
+    
+    function formatDate(timestamp) {
+      if (!timestamp) return '';
+      return new Date(timestamp).toLocaleString();
+    }
+    
+    function updateHeaderInfo(state, restored) {
+      if (!state) return;
+      
+      headerInfo.classList.remove('hidden');
+      visitCountEl.textContent = 'Visit #' + state.visitCount;
+      
+      if (restored) {
+        statusBadge.textContent = 'RESTORED FROM SNAPSHOT';
+        statusBadge.className = 'status-badge restored';
+      } else {
+        statusBadge.textContent = 'FRESH SETUP';
+        statusBadge.className = 'status-badge fresh';
+      }
+      
+      if (state.firstVisitTime) {
+        firstVisitEl.textContent = 'First visit: ' + formatDate(state.firstVisitTime);
+      }
+      
+      // Build timing comparison
+      timingCompare.innerHTML = '';
+      
+      if (state.lastFreshSetupTime > 0) {
+        const freshItem = document.createElement('span');
+        freshItem.className = 'timing-item';
+        freshItem.textContent = 'Fresh setup: ' + formatTime(state.lastFreshSetupTime);
+        timingCompare.appendChild(freshItem);
+      }
+      
+      if (state.lastRestoreTime > 0) {
+        const restoreItem = document.createElement('span');
+        restoreItem.className = 'timing-item highlight';
+        restoreItem.textContent = 'Last restore: ' + formatTime(state.lastRestoreTime);
+        timingCompare.appendChild(restoreItem);
+        
+        // Show speedup if we have both times
+        if (state.lastFreshSetupTime > 0) {
+          const speedup = (state.lastFreshSetupTime / state.lastRestoreTime).toFixed(1);
+          const speedupItem = document.createElement('span');
+          speedupItem.className = 'timing-speedup';
+          speedupItem.textContent = speedup + 'x faster!';
+          timingCompare.appendChild(speedupItem);
+        }
+      }
+      
+      if (state.snapshotCreatedAt) {
+        const snapItem = document.createElement('span');
+        snapItem.className = 'timing-item';
+        snapItem.textContent = 'Snapshot: ' + formatDate(state.snapshotCreatedAt);
+        timingCompare.appendChild(snapItem);
+      }
     }
     
     function runSetup() {
@@ -681,34 +947,64 @@ function getHtmlUI(): string {
         const data = JSON.parse(event.data);
         
         if (data.type === 'step') {
-          appendLog('• ' + data.message);
+          appendLog('> ' + data.message);
         } else if (data.type === 'complete') {
           const clientTime = performance.now() - start;
           appendLog('');
+          
+          // Update header with state info
+          updateHeaderInfo(data.state, data.restored);
+          
           if (data.restored) {
-            appendLog('✓ Restored from snapshot', 'success');
-            timing.textContent = '⏱ ' + formatTime(clientTime) + ' (restored from snapshot)';
+            appendLog('Restored from snapshot', 'success');
+            timing.textContent = formatTime(clientTime) + ' (restored from snapshot)';
             timing.className = 'timing restored';
           } else {
-            appendLog('✓ Fresh setup complete, snapshot created', 'success');
-            timing.textContent = '⏱ ' + formatTime(clientTime) + ' (fresh setup)';
+            appendLog('Fresh setup complete, snapshot created', 'success');
+            timing.textContent = formatTime(clientTime) + ' (fresh setup)';
             timing.className = 'timing fresh';
           }
           timing.classList.remove('hidden');
           eventSource.close();
           setButtons(true);
         } else if (data.type === 'error') {
-          appendLog('✗ ' + data.message, 'error');
+          appendLog('Error: ' + data.message, 'error');
           eventSource.close();
           setButtons(true);
         }
       };
       
       eventSource.onerror = () => {
-        appendLog('✗ Connection lost', 'error');
+        appendLog('Connection lost', 'error');
         eventSource.close();
         setButtons(true);
       };
+    }
+    
+    async function forceSleep() {
+      if (!confirm('Put sandbox to sleep? This will trigger auto-snapshot. Click "Run Setup" after to see the fast restore.')) return;
+      
+      clearLog();
+      setButtons(false);
+      appendLog('Putting sandbox to sleep...');
+      
+      try {
+        const res = await fetch('/sleep', { method: 'POST' });
+        const data = await res.json();
+        
+        if (data.success) {
+          appendLog('');
+          appendLog('Sandbox is now sleeping', 'success');
+          appendLog('');
+          appendLog('Click "Run Setup" to wake the sandbox and see it restore from snapshot.');
+          appendLog('The visit counter will persist, proving the state was saved.');
+        } else {
+          appendLog('Sleep failed: ' + data.error, 'error');
+        }
+      } catch (err) {
+        appendLog('Request failed: ' + err.message, 'error');
+      }
+      setButtons(true);
     }
     
     async function checkStatus() {
@@ -721,14 +1017,19 @@ function getHtmlUI(): string {
         const data = await res.json();
         
         if (data.error) {
-          appendLog('✗ ' + data.error, 'error');
+          appendLog('Error: ' + data.error, 'error');
         } else {
+          // Update header with state info if available
+          if (data.state && data.state.visitCount > 0) {
+            updateHeaderInfo(data.state, data.state.lastRestoreTime > 0);
+          }
+          
           status.innerHTML = '';
           const files = data.filesExist || {};
           Object.entries(files).forEach(([name, exists]) => {
             const item = document.createElement('span');
             item.className = 'status-item ' + (exists ? 'ok' : 'missing');
-            item.textContent = (exists ? '✓ ' : '✗ ') + name;
+            item.textContent = (exists ? '' : 'x ') + name;
             status.appendChild(item);
           });
           
@@ -740,11 +1041,28 @@ function getHtmlUI(): string {
           }
           
           status.classList.remove('hidden');
-          appendLog('Snapshot exists: ' + (data.snapshotExists ? 'Yes' : 'No'));
+          appendLog('');
+          appendLog('Sandbox ID: ' + data.sandboxId);
           appendLog('Project dir: ' + data.projectDir);
+          appendLog('Snapshot exists: ' + (data.snapshotExists ? 'Yes' : 'No'));
+          
+          if (data.state && data.state.visitCount > 0) {
+            appendLog('');
+            appendLog('Persistent State:');
+            appendLog('  Visit count: ' + data.state.visitCount);
+            if (data.state.firstVisitTime) {
+              appendLog('  First visit: ' + formatDate(data.state.firstVisitTime));
+            }
+            if (data.state.lastFreshSetupTime) {
+              appendLog('  Last fresh setup: ' + formatTime(data.state.lastFreshSetupTime));
+            }
+            if (data.state.lastRestoreTime) {
+              appendLog('  Last restore: ' + formatTime(data.state.lastRestoreTime));
+            }
+          }
         }
       } catch (err) {
-        appendLog('✗ Request failed: ' + err.message, 'error');
+        appendLog('Request failed: ' + err.message, 'error');
       }
       setButtons(true);
     }
@@ -761,28 +1079,29 @@ function getHtmlUI(): string {
         const clientTime = performance.now() - start;
         
         if (data.success) {
-          appendLog('✓ Build succeeded in ' + formatTime(clientTime), 'success');
+          appendLog('Build succeeded in ' + formatTime(clientTime), 'success');
           if (data.stdout) {
             appendLog('');
             appendLog('Output:');
             appendLog(data.stdout);
           }
         } else {
-          appendLog('✗ Build failed', 'error');
+          appendLog('Build failed', 'error');
           if (data.stderr) appendLog(data.stderr, 'error');
           if (data.error) appendLog(data.error, 'error');
         }
       } catch (err) {
-        appendLog('✗ Request failed: ' + err.message, 'error');
+        appendLog('Request failed: ' + err.message, 'error');
       }
       setButtons(true);
     }
     
     async function resetSnapshot() {
-      if (!confirm('Delete snapshot and run fresh setup? This will take 1-3 minutes.')) return;
+      if (!confirm('Delete snapshot and start fresh? This will:\\n- Delete the snapshot from R2\\n- Run fresh setup (1-3 minutes)\\n- Reset visit counter')) return;
       
       clearLog();
       setButtons(false);
+      headerInfo.classList.add('hidden');
       appendLog('Deleting snapshot...');
       
       try {
@@ -790,7 +1109,7 @@ function getHtmlUI(): string {
         const delData = await delRes.json();
         
         if (delData.success) {
-          appendLog('✓ Snapshot deleted');
+          appendLog('Snapshot deleted');
           appendLog('');
           appendLog('Running fresh setup...');
           
@@ -801,39 +1120,44 @@ function getHtmlUI(): string {
             const data = JSON.parse(event.data);
             
             if (data.type === 'step') {
-              appendLog('• ' + data.message);
+              appendLog('> ' + data.message);
             } else if (data.type === 'complete') {
               const clientTime = performance.now() - start;
               appendLog('');
-              appendLog('✓ Fresh setup complete', 'success');
-              timing.textContent = '⏱ ' + formatTime(clientTime) + ' (fresh setup after reset)';
+              appendLog('Fresh setup complete', 'success');
+              
+              // Update header with new state
+              updateHeaderInfo(data.state, false);
+              
+              timing.textContent = formatTime(clientTime) + ' (fresh setup after reset)';
               timing.className = 'timing fresh';
               timing.classList.remove('hidden');
               eventSource.close();
               setButtons(true);
             } else if (data.type === 'error') {
-              appendLog('✗ ' + data.message, 'error');
+              appendLog('Error: ' + data.message, 'error');
               eventSource.close();
               setButtons(true);
             }
           };
           
           eventSource.onerror = () => {
-            appendLog('✗ Connection lost', 'error');
+            appendLog('Connection lost', 'error');
             eventSource.close();
             setButtons(true);
           };
         } else {
-          appendLog('✗ Delete failed: ' + delData.error, 'error');
+          appendLog('Delete failed: ' + delData.error, 'error');
           setButtons(true);
         }
       } catch (err) {
-        appendLog('✗ Request failed: ' + err.message, 'error');
+        appendLog('Request failed: ' + err.message, 'error');
         setButtons(true);
       }
     }
     
     btnSetup.addEventListener('click', runSetup);
+    btnSleep.addEventListener('click', forceSleep);
     btnStatus.addEventListener('click', checkStatus);
     btnBuild.addEventListener('click', runBuild);
     btnReset.addEventListener('click', resetSnapshot);
@@ -867,6 +1191,10 @@ export default {
 
       case '/run':
         if (request.method === 'GET') return handleRun(env);
+        break;
+
+      case '/sleep':
+        if (request.method === 'POST') return handleSleep(env);
         break;
     }
 

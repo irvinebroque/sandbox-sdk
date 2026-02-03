@@ -64,25 +64,72 @@ function getZstdLevel(level: 'fast' | 'balanced' | 'max' | number): number {
 const SNAPSHOT_SESSION_ID = '__snapshot__';
 
 /**
+ * Sanitizes a URL by removing query parameters to prevent credential leakage.
+ * Presigned URLs contain sensitive credentials in query params that should
+ * not appear in logs or error messages.
+ */
+function sanitizeUrlForLogging(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  } catch {
+    return '[invalid URL]';
+  }
+}
+
+/**
+ * Sanitizes error output by removing URLs with query parameters.
+ * This prevents credential leakage from curl/wget error messages that
+ * include the full URL with presigned credentials.
+ */
+function sanitizeErrorOutput(errorOutput: string): string {
+  // Match URLs with query parameters and replace with sanitized version
+  return errorOutput.replace(/https?:\/\/[^\s"']+\?[^\s"']*/gi, (url) =>
+    sanitizeUrlForLogging(url)
+  );
+}
+
+/**
+ * Validates that a URL is a trusted storage endpoint (R2 or S3).
+ * Uses regex patterns to prevent hostname spoofing attacks like "evil.com.r2.cloudflarestorage.com".
+ */
+function validateStorageUrl(
+  url: string,
+  operation: 'upload' | 'download'
+): void {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`${operation} URL must use HTTPS`);
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  // Match valid R2/S3 endpoints using regex to prevent hostname spoofing
+  const validPatterns = [
+    /^[a-z0-9-]+\.r2\.cloudflarestorage\.com$/, // R2
+    /^s3\.[a-z0-9-]+\.amazonaws\.com$/, // S3 path-style
+    /^[a-z0-9-]+\.s3\.[a-z0-9-]+\.amazonaws\.com$/ // S3 virtual-hosted
+  ];
+
+  const isValidHost = validPatterns.some((pattern) => pattern.test(hostname));
+  if (!isValidHost) {
+    throw new Error(`${operation} URL must be an R2 or S3 endpoint`);
+  }
+}
+
+/**
  * Validates that an upload URL is a trusted storage endpoint (R2 or S3).
  * Prevents SSRF attacks by restricting upload destinations.
  */
 function validateUploadUrl(url: string): void {
-  const parsed = new URL(url);
-  if (parsed.protocol !== 'https:') {
-    throw new Error('Upload URL must use HTTPS');
-  }
-  const validHostPatterns = [
-    '.r2.cloudflarestorage.com',
-    '.s3.amazonaws.com',
-    '.s3.'
-  ];
-  const isValidHost = validHostPatterns.some((pattern) =>
-    parsed.hostname.includes(pattern)
-  );
-  if (!isValidHost) {
-    throw new Error('Upload URL must be an R2 or S3 endpoint');
-  }
+  validateStorageUrl(url, 'upload');
+}
+
+/**
+ * Validates that a download URL is a trusted storage endpoint (R2 or S3).
+ * Prevents SSRF attacks by restricting download sources to trusted origins only.
+ */
+function validateDownloadUrl(url: string): void {
+  validateStorageUrl(url, 'download');
 }
 
 export class SnapshotService {
@@ -184,7 +231,8 @@ export class SnapshotService {
       // 2. Get manifest of files to include
       const manifestResult = await this.getManifest({
         volumePath,
-        excludePatterns
+        excludePatterns,
+        skipFileHashes: true
       });
 
       if (!manifestResult.success || !manifestResult.files) {
@@ -329,7 +377,7 @@ export class SnapshotService {
       if (uploadResult.data.exitCode !== 0) {
         return {
           success: false,
-          error: `Failed to upload archive: ${uploadResult.data.stderr || 'Unknown error'}`
+          error: `Failed to upload archive: ${sanitizeErrorOutput(uploadResult.data.stderr || 'Unknown error')}`
         };
       }
 
@@ -455,6 +503,16 @@ export class SnapshotService {
       for (const download of downloads) {
         const { snapshotId, url, manifest } = download;
 
+        // Validate download URL to prevent SSRF
+        try {
+          validateDownloadUrl(url);
+        } catch (error) {
+          return {
+            success: false,
+            error: `Invalid download URL for snapshot ${snapshotId}: ${error instanceof Error ? error.message : 'Unknown error'}`
+          };
+        }
+
         this.logger.debug('Downloading snapshot', { snapshotId });
 
         // Download to temp file for hash verification
@@ -490,7 +548,7 @@ export class SnapshotService {
           );
           return {
             success: false,
-            error: `Failed to download snapshot ${snapshotId}: ${downloadResult.data.stderr || 'Download failed'}`
+            error: `Failed to download snapshot ${snapshotId}: ${sanitizeErrorOutput(downloadResult.data.stderr || 'Download failed')}`
           };
         }
 
@@ -608,9 +666,12 @@ export class SnapshotService {
    * Get manifest of files in a volume path
    */
   async getManifest(request: GetManifestRequest): Promise<GetManifestResponse> {
-    const { volumePath, excludePatterns } = request;
+    const { volumePath, excludePatterns, skipFileHashes } = request;
 
     this.logger.debug('Getting manifest', { volumePath, excludePatterns });
+    if (skipFileHashes) {
+      this.logger.debug('Skipping per-file hash computation');
+    }
 
     // Validate volume path for security
     const pathValidation = this.security.validatePath(volumePath);
@@ -792,7 +853,7 @@ export class SnapshotService {
 
         // Compute hash for files (skip for directories and symlinks)
         let hash = '';
-        if (type === 'file' && size > 0) {
+        if (!skipFileHashes && type === 'file' && size > 0) {
           const hashResult = await this.sessionManager.executeInSession(
             SNAPSHOT_SESSION_ID,
             `sha256sum ${shellEscape(fullPath)} | cut -d' ' -f1`,
@@ -967,7 +1028,8 @@ export class SnapshotService {
 
       const manifestResult = await this.getManifest({
         volumePath,
-        excludePatterns
+        excludePatterns,
+        skipFileHashes: true
       });
 
       if (!manifestResult.success || !manifestResult.files) {
@@ -1190,7 +1252,7 @@ export class SnapshotService {
       }
 
       if (uploadResult.data.exitCode !== 0) {
-        const errorMsg = `Failed to upload archive: ${uploadResult.data.stderr || 'Unknown error'}`;
+        const errorMsg = `Failed to upload archive: ${sanitizeErrorOutput(uploadResult.data.stderr || 'Unknown error')}`;
         yield createProgressEvent(
           'error',
           'error',

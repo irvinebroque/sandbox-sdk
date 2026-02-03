@@ -85,6 +85,7 @@ import {
   generatePresignedPutUrl
 } from './utils/s3-presign';
 import { parseTtl } from './utils/ttl';
+import { validateSnapshotId } from './utils/validation';
 import { SDK_VERSION } from './version';
 
 export function getSandbox<T extends Sandbox<any>>(
@@ -161,6 +162,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   private keepAliveEnabled: boolean = false;
   private activeMounts: Map<string, MountInfo> = new Map();
   private transport: 'http' | 'websocket' = 'http';
+  private autoSnapshotInProgress = false;
 
   /**
    * Last restored cache key for content-addressed skip-if-restored optimization
@@ -2810,6 +2812,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     }
 
     const snapshotId = options?.snapshotId || `snap-${Date.now()}`;
+    validateSnapshotId(snapshotId);
 
     // Map compression level to numeric value
     const compressionLevel =
@@ -2941,20 +2944,21 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
    *
    * @example
    * ```typescript
-   * const generator = sandbox.createSnapshotStream(uploadUrl);
-   * for await (const event of generator) {
+   * import { parseSSEStream, SnapshotProgressEvent } from '@cloudflare/sandbox';
+   *
+   * const stream = await sandbox.createSnapshotStream(uploadUrl);
+   * for await (const event of parseSSEStream<SnapshotProgressEvent>(stream)) {
    *   console.log(`${event.phase}: ${event.message}`);
    *   if (event.type === 'error') {
    *     throw new Error(event.error);
    *   }
    * }
-   * const metadata = await generator.return(undefined).value;
    * ```
    */
-  async *createSnapshotStream(
+  async createSnapshotStream(
     uploadUrl: string,
     options?: CreateSnapshotOptions
-  ): AsyncGenerator<SnapshotProgressEvent, SnapshotMetadata, void> {
+  ): Promise<ReadableStream<Uint8Array>> {
     const config = await this.getSnapshotConfig();
     if (!config) {
       throw new Error(
@@ -2967,6 +2971,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     }
 
     const snapshotId = options?.snapshotId || `snap-${Date.now()}`;
+    validateSnapshotId(snapshotId);
 
     // Map compression level to numeric value
     const compressionLevel =
@@ -2986,80 +2991,118 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     };
 
     // Get the streaming response from the container
-    const stream = await this.client.snapshots.createStream(request);
+    const containerStream = await this.client.snapshots.createStream(request);
+    const encoder = new TextEncoder();
+
+    // Capture DO context for use in stream callbacks
+    const self = this;
+    const logger = this.logger;
+    const sandboxName = this.sandboxName;
+    const ctxId = this.ctx.id.toString();
+    const ctxStorage = this.ctx.storage;
+    const tags = options?.tags || {};
+    const ttlString = options?.ttl ?? config.defaultTtl;
+    const volumePath = config.volumePath;
+    const maxSnapshots = config.maxSnapshots;
 
     // Track final stats for metadata
     let finalStats: SnapshotProgressEvent['stats'] | undefined;
     let contentHash: string | undefined;
 
-    // Parse SSE stream and yield progress events
-    for await (const event of parseSSEStream<
-      SnapshotProgressEvent & { contentHash?: string }
-    >(stream)) {
-      // Capture final stats from complete event
-      if (event.type === 'complete' && event.stats) {
-        finalStats = event.stats;
-        contentHash = event.contentHash;
-      }
+    // Return a ReadableStream that wraps the container's SSE stream
+    // This handles DO-side logic (metadata storage) while re-emitting events
+    return new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          for await (const event of parseSSEStream<
+            SnapshotProgressEvent & { contentHash?: string }
+          >(containerStream)) {
+            // Capture final stats from complete event
+            if (event.type === 'complete' && event.stats) {
+              finalStats = event.stats;
+              contentHash = event.contentHash;
 
-      // Yield the progress event to the caller
-      yield event;
+              // Build metadata from captured stats
+              const metadata: SnapshotMetadata = {
+                id: snapshotId,
+                sandboxId: sandboxName || ctxId,
+                volumePath,
+                createdAt: Date.now(),
+                r2Key: `snapshots/${sandboxName || ctxId}/${snapshotId}.tar.zst`,
+                sizeBytes: finalStats?.compressedBytes || 0,
+                uncompressedBytes: finalStats?.totalBytes || 0,
+                fileCount: finalStats?.totalFiles || 0,
+                contentHash: contentHash || '',
+                isIncremental: false,
+                restoreCount: 0,
+                tags
+              };
 
-      // If error event, throw after yielding
-      if (event.type === 'error') {
-        throw new Error(event.error || 'Snapshot creation failed');
-      }
-    }
+              // Compute expiresAt from TTL
+              if (ttlString) {
+                const ttlMs = parseTtl(ttlString);
+                if (ttlMs !== null) {
+                  metadata.expiresAt = Date.now() + ttlMs;
+                }
+              }
 
-    // Build metadata from captured stats
-    const metadata: SnapshotMetadata = {
-      id: snapshotId,
-      sandboxId: this.sandboxName || this.ctx.id.toString(),
-      volumePath: config.volumePath,
-      createdAt: Date.now(),
-      r2Key: `snapshots/${this.sandboxName || this.ctx.id.toString()}/${snapshotId}.tar.zst`,
-      sizeBytes: finalStats?.compressedBytes || 0,
-      uncompressedBytes: finalStats?.totalBytes || 0,
-      fileCount: finalStats?.totalFiles || 0,
-      contentHash: contentHash || '',
-      isIncremental: false,
-      restoreCount: 0,
-      tags: options?.tags || {}
-    };
+              // Store metadata (atomic - no separate list to maintain)
+              await ctxStorage.put(`snapshot:meta:${snapshotId}`, metadata);
 
-    // Compute expiresAt from TTL (per-snapshot TTL takes precedence over config default)
-    const ttlString = options?.ttl ?? config.defaultTtl;
-    if (ttlString) {
-      const ttlMs = parseTtl(ttlString);
-      if (ttlMs !== null) {
-        metadata.expiresAt = Date.now() + ttlMs;
-      }
-    }
+              // Cleanup old snapshots if over limit
+              if (maxSnapshots) {
+                const snapshots = await self.listSnapshots();
+                if (snapshots.length > maxSnapshots) {
+                  const toDelete = snapshots
+                    .sort((a, b) => a.createdAt - b.createdAt)
+                    .slice(0, snapshots.length - maxSnapshots);
 
-    // Store metadata (atomic - no separate list to maintain)
-    await this.ctx.storage.put(`snapshot:meta:${snapshotId}`, metadata);
+                  for (const old of toDelete) {
+                    await self.deleteSnapshotMetadata(old.id);
+                  }
+                }
+              }
 
-    // Cleanup old snapshots if over limit
-    if (config.maxSnapshots) {
-      const snapshots = await this.listSnapshots();
-      if (snapshots.length > config.maxSnapshots) {
-        const toDelete = snapshots
-          .sort((a, b) => a.createdAt - b.createdAt)
-          .slice(0, snapshots.length - config.maxSnapshots);
+              logger.info('Snapshot created (streaming)', {
+                snapshotId,
+                fileCount: metadata.fileCount,
+                sizeBytes: metadata.sizeBytes
+              });
+            }
 
-        for (const old of toDelete) {
-          await this.deleteSnapshotMetadata(old.id);
+            // Re-emit event as SSE format
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+            );
+
+            // If error event, close the stream after emitting
+            if (event.type === 'error') {
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+              return;
+            }
+          }
+
+          // Send completion marker and close
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        } finally {
+          // Ensure container stream is cleaned up
+          try {
+            if (
+              containerStream &&
+              typeof (containerStream as any).cancel === 'function'
+            ) {
+              await (containerStream as any).cancel();
+            }
+          } catch {
+            // Ignore cleanup errors
+          }
         }
       }
-    }
-
-    this.logger.info('Snapshot created (streaming)', {
-      snapshotId,
-      fileCount: metadata.fileCount,
-      sizeBytes: metadata.sizeBytes
     });
-
-    return metadata;
   }
 
   /**
@@ -3085,6 +3128,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Get snapshot metadata
     let metadata: SnapshotMetadata | undefined;
     if (snapshotId) {
+      validateSnapshotId(snapshotId);
       metadata = await this.ctx.storage.get<SnapshotMetadata>(
         `snapshot:meta:${snapshotId}`
       );
@@ -3189,6 +3233,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Get snapshot metadata
     let metadata: SnapshotMetadata | undefined;
     if (snapshotId) {
+      validateSnapshotId(snapshotId);
       metadata = await this.ctx.storage.get<SnapshotMetadata>(
         `snapshot:meta:${snapshotId}`
       );
@@ -3384,6 +3429,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
    * @param snapshotId - ID of snapshot to delete
    */
   async deleteSnapshotMetadata(snapshotId: string): Promise<void> {
+    validateSnapshotId(snapshotId);
     // Simply delete the metadata key - no separate list to maintain
     await this.ctx.storage.delete(`snapshot:meta:${snapshotId}`);
     this.logger.info('Snapshot metadata deleted', { snapshotId });
@@ -3406,6 +3452,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   async getSnapshotMetadata(
     snapshotId: string
   ): Promise<SnapshotMetadata | null> {
+    validateSnapshotId(snapshotId);
     return (
       (await this.ctx.storage.get<SnapshotMetadata>(
         `snapshot:meta:${snapshotId}`
@@ -3506,37 +3553,46 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
    * proceeds with shutdown regardless to avoid stuck containers.
    */
   private async maybeAutoSnapshotWithRetry(): Promise<void> {
-    const config = await this.getSnapshotConfig();
-    if (!config?.enabled || !config.autoSnapshotOnSleep) {
+    if (this.autoSnapshotInProgress) {
+      this.logger.debug('Auto-snapshot already in progress, skipping');
       return;
     }
+    this.autoSnapshotInProgress = true;
+    try {
+      const config = await this.getSnapshotConfig();
+      if (!config?.enabled || !config.autoSnapshotOnSleep) {
+        return;
+      }
 
-    const creds = await this.getR2Credentials();
-    if (!creds) {
-      this.logger.warn(
-        'Auto-snapshot enabled but no R2 credentials configured - skipping'
-      );
-      return;
-    }
+      const creds = await this.getR2Credentials();
+      if (!creds) {
+        this.logger.warn(
+          'Auto-snapshot enabled but no R2 credentials configured - skipping'
+        );
+        return;
+      }
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await this.performAutoSnapshot(config, creds);
-        return; // Success
-      } catch (error) {
-        const errorObj =
-          error instanceof Error ? error : new Error(String(error));
-        if (attempt === 1) {
-          this.logger.warn('Auto-snapshot attempt 1 failed, retrying', {
-            error: errorObj.message
-          });
-        } else {
-          this.logger.error(
-            'Auto-snapshot failed after retry, proceeding with shutdown',
-            errorObj
-          );
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await this.performAutoSnapshot(config, creds);
+          return; // Success
+        } catch (error) {
+          const errorObj =
+            error instanceof Error ? error : new Error(String(error));
+          if (attempt === 1) {
+            this.logger.warn('Auto-snapshot attempt 1 failed, retrying', {
+              error: errorObj.message
+            });
+          } else {
+            this.logger.error(
+              'Auto-snapshot failed after retry, proceeding with shutdown',
+              errorObj
+            );
+          }
         }
       }
+    } finally {
+      this.autoSnapshotInProgress = false;
     }
   }
 

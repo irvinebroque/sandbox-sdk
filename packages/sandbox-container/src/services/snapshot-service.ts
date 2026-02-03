@@ -63,6 +63,28 @@ function getZstdLevel(level: 'fast' | 'balanced' | 'max' | number): number {
  */
 const SNAPSHOT_SESSION_ID = '__snapshot__';
 
+/**
+ * Validates that an upload URL is a trusted storage endpoint (R2 or S3).
+ * Prevents SSRF attacks by restricting upload destinations.
+ */
+function validateUploadUrl(url: string): void {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Upload URL must use HTTPS');
+  }
+  const validHostPatterns = [
+    '.r2.cloudflarestorage.com',
+    '.s3.amazonaws.com',
+    '.s3.'
+  ];
+  const isValidHost = validHostPatterns.some((pattern) =>
+    parsed.hostname.includes(pattern)
+  );
+  if (!isValidHost) {
+    throw new Error('Upload URL must be an R2 or S3 endpoint');
+  }
+}
+
 export class SnapshotService {
   constructor(
     private sessionManager: SessionManager,
@@ -186,15 +208,14 @@ export class SnapshotService {
       }
 
       // 3. Create file list for tar (exclude patterns applied in manifest)
-      const fileListPath = `/tmp/snapshot-${snapshotId}-files.txt`;
+      const fileListPath = `/tmp/snapshot-${crypto.randomUUID()}-files.txt`;
       const fileList = files.map((f: FileEntry) => f.path).join('\n');
 
-      // Write file list using session
-      // Use a random delimiter to prevent command injection if a filename contains the delimiter
-      const delimiter = `SNAPSHOT_EOF_${crypto.randomUUID().replace(/-/g, '')}`;
+      // Write file list using base64 encoding to safely pass content
+      const encodedList = Buffer.from(fileList).toString('base64');
       const writeResult = await this.sessionManager.executeInSession(
         SNAPSHOT_SESSION_ID,
-        `cat > ${shellEscape(fileListPath)} << '${delimiter}'\n${fileList}\n${delimiter}`,
+        `echo ${shellEscape(encodedList)} | base64 -d > ${shellEscape(fileListPath)}`,
         volumePath,
         timeout
       );
@@ -213,9 +234,12 @@ export class SnapshotService {
         };
       }
 
+      // Validate upload URL before using it
+      validateUploadUrl(uploadUrl);
+
       // 4. Create tar archive with zstd compression and stream to R2
       // Use a temp file approach for MVP (streaming via curl would be more complex)
-      const archivePath = `/tmp/snapshot-${snapshotId}.tar.zst`;
+      const archivePath = `/tmp/snapshot-${crypto.randomUUID()}.tar.zst`;
       const zstdLevel = getZstdLevel(compressionLevel);
 
       // Build optimized zstd command
@@ -434,7 +458,7 @@ export class SnapshotService {
         this.logger.debug('Downloading snapshot', { snapshotId });
 
         // Download to temp file for hash verification
-        const tempFile = `/tmp/snapshot-${snapshotId}-${Date.now()}.tar.zst`;
+        const tempFile = `/tmp/snapshot-${crypto.randomUUID()}.tar.zst`;
         const downloadCommand = `curl -sf ${shellEscape(url)} -o ${shellEscape(tempFile)}`;
 
         const downloadResult = await this.sessionManager.executeInSession(
@@ -609,9 +633,19 @@ export class SnapshotService {
           '\r',
           ';',
           '|',
-          '&'
+          '&',
+          '>',
+          '<',
+          '#'
         ];
+        const MAX_PATTERN_LENGTH = 256;
         for (const pattern of excludePatterns) {
+          if (pattern.length > MAX_PATTERN_LENGTH) {
+            return {
+              success: false,
+              error: `Invalid exclude pattern: exceeds maximum length of ${MAX_PATTERN_LENGTH} characters`
+            };
+          }
           for (const dangerous of DANGEROUS_CHARS) {
             if (pattern.includes(dangerous)) {
               return {
@@ -868,13 +902,15 @@ export class SnapshotService {
       phase: SnapshotPhase,
       message: string,
       stats?: SnapshotProgressEvent['stats'],
-      error?: string
+      error?: string,
+      contentHash?: string
     ): SnapshotProgressEvent => ({
       type,
       phase,
       message,
       stats,
-      error
+      error,
+      contentHash
     });
 
     try {
@@ -969,14 +1005,14 @@ export class SnapshotService {
       );
 
       // Create file list for tar
-      const fileListPath = `/tmp/snapshot-${snapshotId}-files.txt`;
+      const fileListPath = `/tmp/snapshot-${crypto.randomUUID()}-files.txt`;
       const fileList = files.map((f: FileEntry) => f.path).join('\n');
 
-      // Use a random delimiter to prevent command injection if a filename contains the delimiter
-      const delimiter = `SNAPSHOT_EOF_${crypto.randomUUID().replace(/-/g, '')}`;
+      // Write file list using base64 encoding to safely pass content
+      const encodedList = Buffer.from(fileList).toString('base64');
       const writeResult = await this.sessionManager.executeInSession(
         SNAPSHOT_SESSION_ID,
-        `cat > ${shellEscape(fileListPath)} << '${delimiter}'\n${fileList}\n${delimiter}`,
+        `echo ${shellEscape(encodedList)} | base64 -d > ${shellEscape(fileListPath)}`,
         volumePath,
         timeout
       );
@@ -1011,8 +1047,11 @@ export class SnapshotService {
         };
       }
 
+      // Validate upload URL before using it
+      validateUploadUrl(uploadUrl);
+
       // Create tar archive with optimized zstd compression
-      const archivePath = `/tmp/snapshot-${snapshotId}.tar.zst`;
+      const archivePath = `/tmp/snapshot-${crypto.randomUUID()}.tar.zst`;
       const zstdLevel = getZstdLevel(compressionLevel);
 
       // Build optimized zstd command (same as in createSnapshot)
@@ -1204,7 +1243,9 @@ export class SnapshotService {
         'complete',
         'complete',
         'Snapshot created successfully',
-        { totalFiles: fileCount, totalBytes, compressedBytes, duration }
+        { totalFiles: fileCount, totalBytes, compressedBytes, duration },
+        undefined,
+        contentHash
       );
 
       return {

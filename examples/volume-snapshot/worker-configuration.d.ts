@@ -69,7 +69,7 @@ declare module '@cloudflare/sandbox' {
     createSnapshot(uploadUrl: string): Promise<CreateSnapshotResponse>;
     createSnapshotStream(
       uploadUrl: string
-    ): AsyncGenerator<SnapshotProgressEvent, void, void>;
+    ): Promise<ReadableStream<Uint8Array>>;
     restoreSnapshot(downloadUrl: string, snapshotId: string): Promise<RestoreResult>;
   }
 }

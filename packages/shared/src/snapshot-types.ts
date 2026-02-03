@@ -389,6 +389,8 @@ export interface SnapshotProgressEvent {
     compressedBytes?: number;
     duration?: number;
   };
+  /** SHA-256 hash of archive content (only present in 'complete' events) */
+  contentHash?: string;
   /** Error message if type is 'error' */
   error?: string;
 }

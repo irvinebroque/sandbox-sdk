@@ -12,8 +12,8 @@
 
 import type { R2CredentialConfig } from '@repo/shared';
 
-/** Default URL expiry in seconds (1 hour) */
-const DEFAULT_URL_EXPIRY = 3600;
+/** Default URL expiry in seconds (15 minutes - shorter window reduces URL leak risk) */
+const DEFAULT_URL_EXPIRY = 900;
 
 /** AWS region for R2 (always "auto") */
 const R2_REGION = 'auto';

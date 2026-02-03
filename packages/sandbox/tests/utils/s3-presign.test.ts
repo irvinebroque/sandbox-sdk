@@ -282,13 +282,13 @@ describe('urlExpiry parameter', () => {
     vi.useRealTimers();
   });
 
-  it('uses default expiry of 3600 seconds when not specified', async () => {
+  it('uses default expiry of 900 seconds (15 min) when not specified', async () => {
     const config = createTestConfig();
     const url = await generatePresignedPutUrl(config, 'test/key.txt');
 
     const params = extractSignatureParams(url);
 
-    expect(params.get('X-Amz-Expires')).toBe('3600');
+    expect(params.get('X-Amz-Expires')).toBe('900');
   });
 
   it('respects custom urlExpiry value', async () => {
@@ -325,7 +325,7 @@ describe('urlExpiry parameter', () => {
 
     const params = extractSignatureParams(url);
 
-    expect(params.get('X-Amz-Expires')).toBe('3600');
+    expect(params.get('X-Amz-Expires')).toBe('900');
   });
 });
 

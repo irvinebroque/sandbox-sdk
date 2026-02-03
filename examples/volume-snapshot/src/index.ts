@@ -15,7 +15,11 @@ import {
   S3Client
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { getSandbox } from '@cloudflare/sandbox';
+import {
+  getSandbox,
+  parseSSEStream,
+  type SnapshotProgressEvent
+} from '@cloudflare/sandbox';
 
 export { Sandbox } from '@cloudflare/sandbox';
 
@@ -299,7 +303,10 @@ function handleSetup(env: Env): Response {
         compressedBytes?: number;
       } = {};
 
-      for await (const event of sandbox.createSnapshotStream(uploadUrl)) {
+      const snapshotStream = await sandbox.createSnapshotStream(uploadUrl);
+      for await (const event of parseSSEStream<SnapshotProgressEvent>(
+        snapshotStream
+      )) {
         // Forward progress events to the client
         await sendStep(`[${event.phase}] ${event.message}`);
 

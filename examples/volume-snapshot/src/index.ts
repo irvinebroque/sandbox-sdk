@@ -104,7 +104,7 @@ interface SimpleLogger {
 
 function createSimpleLogger(
   baseContext: Record<string, unknown>,
-  sendToUI?: (level: string, message: string) => Promise<void>
+  sendToUI?: (level: string, message: string) => void
 ): SimpleLogger {
   const log = (
     level: string,
@@ -178,21 +178,14 @@ function formatContextSuffixSimple(context?: Record<string, unknown>): string {
 // Repository to clone - Astro blog starter template
 const REPO_URL =
   'https://github.com/irvinebroque/astro-blog-starter-template.git';
+const SANDBOX_ID = 'volume-snapshot-demo';
 const WORKSPACE = '/workspace';
 const PROJECT_DIR = `${WORKSPACE}/astro-blog-starter-template`;
 const STATE_FILE = `${WORKSPACE}/.sandbox-state.json`;
 
 // Snapshot configuration
-const SNAPSHOT_KEY_PREFIX = 'snapshots/';
+const SNAPSHOT_OBJECT_KEY = `snapshots/${SANDBOX_ID}/latest.tar.zst`;
 const PRESIGNED_URL_EXPIRY = 3600; // 1 hour
-
-interface SnapshotMetadata {
-  id: string;
-  createdAt: number;
-  r2Key: string;
-  repoUrl: string;
-  projectDir: string;
-}
 
 /**
  * Persistent state that survives snapshots, proving restoration works
@@ -362,13 +355,18 @@ function handleSetup(env: Env): Response {
   const writer = stream.writable.getWriter();
   const startTime = Date.now();
 
-  const sendEvent = async (event: SetupEvent) => {
-    await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+  const sendEvent = (event: SetupEvent) => {
+    if (writer.desiredSize !== null && writer.desiredSize <= 0) {
+      return;
+    }
+    void writer
+      .write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+      .catch(() => {});
   };
 
   // Create sendToUI function for streaming logs to client
-  const sendToUI = async (level: string, message: string) => {
-    await sendEvent({
+  const sendToUI = (level: string, message: string) => {
+    sendEvent({
       type: 'log',
       level: level as 'debug' | 'info' | 'warn' | 'error',
       message,
@@ -381,7 +379,7 @@ function handleSetup(env: Env): Response {
   const logger = createSimpleLogger(
     {
       component: 'sandbox-do',
-      sandboxId: 'volume-snapshot-demo',
+      sandboxId: SANDBOX_ID,
       operation: 'setup'
     },
     sendToUI
@@ -389,7 +387,7 @@ function handleSetup(env: Env): Response {
 
   // Run setup in background, streaming progress
   (async () => {
-    const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo', {
+    const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
       debug: true
     });
 
@@ -411,92 +409,34 @@ function handleSetup(env: Env): Response {
         state.firstVisitTime = Date.now();
       }
 
-      logger.info('Checking for snapshot', { visitCount: state.visitCount });
-
-      // Check for existing snapshot
-      const existingSnapshot = await env.SNAPSHOTS.head(
-        `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`
+      logger.info('Configuring snapshots...');
+      await withPeriodicLogging(
+        sandbox.configureSnapshots({
+          enabled: true,
+          volumePath: WORKSPACE,
+          compressionLevel: 'fast',
+          excludePatterns: []
+        }),
+        'configureSnapshots',
+        logger
       );
+      logger.info('Snapshots configured');
 
-      if (existingSnapshot) {
-        // Configure snapshots with auto-restore and content-addressed keys
-        logger.info('Configuring snapshots (existing snapshot found)...');
-        await withPeriodicLogging(
-          sandbox.configureSnapshots({
-            enabled: true,
-            volumePath: WORKSPACE,
-            maxSnapshots: 5,
-            compressionLevel: 'fast',
-            excludePatterns: [],
-            autoRestoreOnWake: true,
-            autoSnapshotOnSleep: true,
-            useContentAddressedKeys: true
-          }),
-          'configureSnapshots',
-          logger
-        );
-        logger.info('Snapshots configured');
+      logger.info('Checking for snapshot metadata', {
+        visitCount: state.visitCount
+      });
+      const metadata = await sandbox.getSnapshotMetadata('latest');
 
-        // Configure R2 credentials for auto-snapshot/restore functionality
-        logger.info('Configuring R2 credentials...');
-        await withPeriodicLogging(
-          sandbox.configureR2Credentials({
-            accountId: env.CF_ACCOUNT_ID,
-            bucketName: env.R2_BUCKET_NAME,
-            accessKeyId: env.R2_ACCESS_KEY_ID,
-            secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-            keyPrefix: SNAPSHOT_KEY_PREFIX
-          }),
-          'configureR2Credentials',
-          logger
-        );
-        logger.info('R2 credentials configured');
-
-        // Check if project directory already exists (auto-restore may have already run)
-        logger.info('Checking if project directory exists...');
-        const checkResult = await withPeriodicLogging(
-          sandbox.exec(`test -d ${PROJECT_DIR} && echo "exists"`, {
-            timeout: 5000
-          }),
-          'check project directory',
-          logger
-        );
-        const alreadyRestored = checkResult.stdout.trim() === 'exists';
-        logger.info(
-          `Project directory check complete: ${alreadyRestored ? 'exists' : 'does not exist'}`
-        );
-
-        if (alreadyRestored) {
-          // Auto-restore already ran when container woke up
-          const duration = Date.now() - startTime;
-          state.lastRestoreTime = duration;
-
-          // Update state file
-          await writeSandboxState(sandbox, state, logger);
-
-          logger.info(
-            'Project directory exists (auto-restored on wake) - skipping manual restore'
-          );
-          await sendEvent({
-            type: 'complete',
-            success: true,
-            restored: true,
-            duration,
-            state,
-            stats: { filesRestored: 0 }
-          });
-          await writer.close();
-          return;
-        }
-
-        // Manual restore needed
-        logger.info('Found existing snapshot, generating download URL...');
+      if (metadata) {
+        logger.info('Snapshot metadata found, starting restore', {
+          r2Key: metadata.r2Key
+        });
         const downloadUrl = await withPeriodicLogging(
-          getDownloadUrl(env, `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`),
+          getDownloadUrl(env, metadata.r2Key),
           'generate download URL',
           logger
         );
-        logger.info('Download URL generated, starting restore...');
+        logger.info('Download URL generated, restoring snapshot...');
         const restoreResult = await withPeriodicLogging(
           sandbox.restoreSnapshot(downloadUrl, 'latest'),
           'restoreSnapshot',
@@ -506,25 +446,22 @@ function handleSetup(env: Env): Response {
 
         if (restoreResult.success) {
           const duration = Date.now() - startTime;
-
-          // Re-read state after restore (snapshot may contain updated state)
           state = await readSandboxState(sandbox);
           state.visitCount++;
           if (state.firstVisitTime === 0) {
             state.firstVisitTime = Date.now();
           }
           state.lastRestoreTime = duration;
+          state.snapshotCreatedAt = metadata.createdAt;
 
-          // Update state file
           await writeSandboxState(sandbox, state, logger);
 
           logger.info('Snapshot restored', {
             filesRestored: restoreResult.stats.filesRestored,
             duration: restoreResult.stats.duration
           });
-          logger.info('Verified project directory exists');
 
-          await sendEvent({
+          sendEvent({
             type: 'complete',
             success: true,
             restored: true,
@@ -532,48 +469,14 @@ function handleSetup(env: Env): Response {
             state,
             stats: { filesRestored: restoreResult.stats.filesRestored }
           });
-          await writer.close();
           return;
-        } else {
-          logger.warn('Snapshot restore failed, falling back to fresh setup');
         }
+
+        logger.warn('Snapshot restore failed, falling back to fresh setup');
       }
 
       // No snapshot or restore failed - do fresh setup
       logger.info('No snapshot found, performing fresh setup');
-
-      // Configure snapshots with content-addressed keys for automatic deduplication
-      logger.info('Configuring snapshots (fresh setup)...');
-      await withPeriodicLogging(
-        sandbox.configureSnapshots({
-          enabled: true,
-          volumePath: WORKSPACE,
-          maxSnapshots: 5,
-          compressionLevel: 'fast',
-          excludePatterns: [],
-          autoRestoreOnWake: true,
-          autoSnapshotOnSleep: true,
-          useContentAddressedKeys: true
-        }),
-        'configureSnapshots',
-        logger
-      );
-      logger.info('Snapshots configured');
-
-      // Configure R2 credentials for auto-snapshot/restore functionality
-      logger.info('Configuring R2 credentials (fresh setup)...');
-      await withPeriodicLogging(
-        sandbox.configureR2Credentials({
-          accountId: env.CF_ACCOUNT_ID,
-          bucketName: env.R2_BUCKET_NAME,
-          accessKeyId: env.R2_ACCESS_KEY_ID,
-          secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-          keyPrefix: SNAPSHOT_KEY_PREFIX
-        }),
-        'configureR2Credentials',
-        logger
-      );
-      logger.info('R2 credentials configured');
 
       // Clone the repository with streaming output
       logger.info('Cloning repository', { repoUrl: REPO_URL });
@@ -585,9 +488,9 @@ function handleSetup(env: Env): Response {
           cwd: WORKSPACE,
           timeout: 120000,
           stream: true,
-          onOutput: async (_stream, data) => {
+          onOutput: (_stream, data) => {
             // Send raw output to terminal for proper \r handling
-            await sendEvent({
+            sendEvent({
               type: 'raw' as const,
               data: data
             });
@@ -607,9 +510,9 @@ function handleSetup(env: Env): Response {
           cwd: PROJECT_DIR,
           timeout: 300000,
           stream: true,
-          onOutput: async (_stream, data) => {
+          onOutput: (_stream, data) => {
             // Send raw output to terminal for proper \r handling
-            await sendEvent({
+            sendEvent({
               type: 'raw' as const,
               data: data
             });
@@ -641,14 +544,12 @@ function handleSetup(env: Env): Response {
       // Create snapshot with streaming progress
       const snapshotStart = Date.now();
 
-      const snapshotId = `snapshot-${Date.now()}`;
-      const r2Key = `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`;
+      const r2Key = SNAPSHOT_OBJECT_KEY;
       logger.info('Generating upload URL');
       const uploadUrl = await getUploadUrl(env, r2Key);
 
       // Use streaming API for real-time progress updates
       let snapshotStats: {
-        totalFiles?: number;
         compressedBytes?: number;
       } = {};
 
@@ -676,7 +577,6 @@ function handleSetup(env: Env): Response {
         // Capture final stats
         if (event.stats) {
           snapshotStats = {
-            totalFiles: event.stats.totalFiles ?? snapshotStats.totalFiles,
             compressedBytes:
               event.stats.compressedBytes ?? snapshotStats.compressedBytes
           };
@@ -686,41 +586,29 @@ function handleSetup(env: Env): Response {
       const snapshotDuration = Date.now() - snapshotStart;
       logger.info('Snapshot created', {
         duration: snapshotDuration,
-        totalFiles: snapshotStats.totalFiles,
         compressedBytes: snapshotStats.compressedBytes
       });
 
-      // Store snapshot metadata
-      const metadata: SnapshotMetadata = {
-        id: snapshotId,
-        createdAt: Date.now(),
-        r2Key,
-        repoUrl: REPO_URL,
-        projectDir: PROJECT_DIR
-      };
-      await env.SNAPSHOTS.put(
-        `${SNAPSHOT_KEY_PREFIX}metadata.json`,
-        JSON.stringify(metadata)
-      );
-      logger.info('Snapshot metadata saved');
-
-      await sendEvent({
+      sendEvent({
         type: 'complete',
         success: true,
         restored: false,
         duration: totalDuration,
         state,
         stats: {
-          totalFiles: snapshotStats.totalFiles,
           compressedBytes: snapshotStats.compressedBytes
         }
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger.error('Setup failed', error instanceof Error ? error : undefined);
-      await sendEvent({ type: 'error', message });
+      sendEvent({ type: 'error', message });
     } finally {
-      await writer.close();
+      try {
+        await writer.close();
+      } catch {
+        // Ignore double-close errors
+      }
     }
   })();
 
@@ -740,12 +628,12 @@ async function handleStatus(env: Env): Promise<Response> {
   const startTime = Date.now();
   const logger = createSimpleLogger({
     component: 'sandbox-do',
-    sandboxId: 'volume-snapshot-demo',
+    sandboxId: SANDBOX_ID,
     operation: 'status'
   });
 
   logger.info('Checking status');
-  const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo', {
+  const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
     debug: true
   });
 
@@ -767,24 +655,13 @@ async function handleStatus(env: Env): Promise<Response> {
     logger.info('Reading sandbox state');
     const state = await readSandboxState(sandbox);
 
-    // Get snapshot metadata if available
-    const metadataObj = await env.SNAPSHOTS.get(
-      `${SNAPSHOT_KEY_PREFIX}metadata.json`
-    );
-    const metadata = metadataObj
-      ? await metadataObj.json<SnapshotMetadata>()
-      : null;
-
-    // Check if snapshot exists
-    const snapshotExists = await env.SNAPSHOTS.head(
-      `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`
-    );
+    const metadata = await sandbox.getSnapshotMetadata('latest');
 
     const duration = Date.now() - startTime;
     logger.info('Status check complete', { duration });
 
     return Response.json({
-      sandboxId: 'volume-snapshot-demo',
+      sandboxId: SANDBOX_ID,
       projectDir: PROJECT_DIR,
       filesExist: {
         'package.json': packageJson.stdout.includes('exists'),
@@ -793,7 +670,7 @@ async function handleStatus(env: Env): Promise<Response> {
       },
       nodeModulesPackageCount:
         parseInt(nodeModulesCount.stdout.trim(), 10) || 0,
-      snapshotExists: !!snapshotExists,
+      snapshotExists: metadata != null,
       snapshotMetadata: metadata,
       state
     });
@@ -814,35 +691,30 @@ async function handleCreateSnapshot(env: Env): Promise<Response> {
   const startTime = Date.now();
   const logger = createSimpleLogger({
     component: 'sandbox-do',
-    sandboxId: 'volume-snapshot-demo',
+    sandboxId: SANDBOX_ID,
     operation: 'create-snapshot'
   });
 
   logger.info('Creating snapshot manually');
-  const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo', {
+  const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
     debug: true
   });
 
   try {
-    // Ensure snapshots are configured with optimizations
     logger.info('Configuring snapshots...');
     await withPeriodicLogging(
       sandbox.configureSnapshots({
         enabled: true,
         volumePath: WORKSPACE,
-        maxSnapshots: 5,
         compressionLevel: 'fast',
-        excludePatterns: [],
-        autoSnapshotOnSleep: false,
-        autoRestoreOnWake: false,
-        useContentAddressedKeys: true
+        excludePatterns: []
       }),
       'configureSnapshots',
       logger
     );
     logger.info('Snapshots configured');
 
-    const r2Key = `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`;
+    const r2Key = SNAPSHOT_OBJECT_KEY;
     logger.info('Generating upload URL...');
     const uploadUrl = await withPeriodicLogging(
       getUploadUrl(env, r2Key),
@@ -853,7 +725,7 @@ async function handleCreateSnapshot(env: Env): Promise<Response> {
 
     const createStart = Date.now();
     logger.info('Creating snapshot (non-streaming)...');
-    const result = await withPeriodicLogging(
+    const metadata = await withPeriodicLogging(
       sandbox.createSnapshot(uploadUrl),
       'createSnapshot',
       logger
@@ -861,41 +733,15 @@ async function handleCreateSnapshot(env: Env): Promise<Response> {
     const duration = Date.now() - createStart;
     logger.info('Snapshot creation completed');
 
-    // Handle skip-if-restored: null means content unchanged, snapshot skipped
-    if (result === null) {
-      logger.info('Snapshot skipped (content unchanged)', { duration });
-      return Response.json({
-        success: true,
-        skipped: true,
-        reason: 'Content unchanged since last restore',
-        duration
-      });
-    }
-
-    // Update metadata
-    const metadata: SnapshotMetadata = {
-      id: `snapshot-${Date.now()}`,
-      createdAt: Date.now(),
-      r2Key,
-      repoUrl: REPO_URL,
-      projectDir: PROJECT_DIR
-    };
-    await env.SNAPSHOTS.put(
-      `${SNAPSHOT_KEY_PREFIX}metadata.json`,
-      JSON.stringify(metadata)
-    );
-
     const totalDuration = Date.now() - startTime;
     logger.info('Snapshot created', { duration: totalDuration });
 
     return Response.json({
       success: true,
-      skipped: false,
       duration,
       stats: {
-        fileCount: (result as any).fileCount,
-        sizeBytes: (result as any).sizeBytes,
-        uncompressedBytes: (result as any).uncompressedBytes
+        fileCount: metadata.fileCount,
+        sizeBytes: metadata.sizeBytes
       }
     });
   } catch (error) {
@@ -915,22 +761,20 @@ async function handleRestore(env: Env): Promise<Response> {
   const startTime = Date.now();
   const logger = createSimpleLogger({
     component: 'sandbox-do',
-    sandboxId: 'volume-snapshot-demo',
+    sandboxId: SANDBOX_ID,
     operation: 'restore'
   });
 
   logger.info('Restoring snapshot manually');
-  const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo', {
+  const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
     debug: true
   });
 
   try {
-    // Check if snapshot exists
-    logger.info('Checking snapshot existence');
-    const snapshotExists = await env.SNAPSHOTS.head(
-      `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`
-    );
-    if (!snapshotExists) {
+    // Check if snapshot metadata exists
+    logger.info('Checking snapshot metadata');
+    const metadata = await sandbox.getSnapshotMetadata('latest');
+    if (!metadata) {
       logger.warn('No snapshot found');
       return Response.json(
         { success: false, error: 'No snapshot found. Run /setup first.' },
@@ -938,18 +782,14 @@ async function handleRestore(env: Env): Promise<Response> {
       );
     }
 
-    // Configure snapshots with optimizations
+    // Configure snapshots
     logger.info('Configuring snapshots...');
     await withPeriodicLogging(
       sandbox.configureSnapshots({
         enabled: true,
         volumePath: WORKSPACE,
-        maxSnapshots: 5,
         compressionLevel: 'fast',
-        excludePatterns: [],
-        autoSnapshotOnSleep: false,
-        autoRestoreOnWake: false,
-        useContentAddressedKeys: true
+        excludePatterns: []
       }),
       'configureSnapshots',
       logger
@@ -958,7 +798,7 @@ async function handleRestore(env: Env): Promise<Response> {
 
     logger.info('Generating download URL...');
     const downloadUrl = await withPeriodicLogging(
-      getDownloadUrl(env, `${SNAPSHOT_KEY_PREFIX}latest.tar.zst`),
+      getDownloadUrl(env, metadata.r2Key),
       'generate download URL',
       logger
     );
@@ -1004,50 +844,48 @@ async function handleRestore(env: Env): Promise<Response> {
 async function handleDeleteSnapshot(env: Env): Promise<Response> {
   const logger = createSimpleLogger({
     component: 'sandbox-do',
-    sandboxId: 'volume-snapshot-demo',
+    sandboxId: SANDBOX_ID,
     operation: 'delete-snapshot'
   });
 
   logger.info('Deleting snapshot and resetting sandbox state');
-  const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo', {
+  const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
     debug: true
   });
 
   try {
-    // 1. Destroy the container first to stop any auto-restore
+    // 1. Destroy the container first to ensure a clean slate
     logger.info('Destroying sandbox container');
     await sandbox.destroy();
 
-    // 2. Disable snapshots to prevent auto-restore on next wake
+    // 2. Disable snapshots for the next run
     logger.info('Disabling snapshot configuration');
     await sandbox.configureSnapshots({
       enabled: false,
       volumePath: WORKSPACE,
-      autoRestoreOnWake: false,
-      autoSnapshotOnSleep: false,
-      maxSnapshots: 1,
       compressionLevel: 'fast',
       excludePatterns: []
     });
 
-    // 3. Delete all snapshot metadata from DO storage
+    // 3. Delete snapshot metadata from DO storage
     logger.info('Deleting snapshot metadata');
-    const snapshots = await sandbox.listSnapshots();
-    for (const snap of snapshots) {
-      await sandbox.deleteSnapshotMetadata(snap.id);
+    const metadata = await sandbox.getSnapshotMetadata('latest');
+    if (metadata) {
+      await sandbox.deleteSnapshotMetadata('latest');
+      logger.info('Deleted snapshot metadata');
+    } else {
+      logger.info('No snapshot metadata found');
     }
-    logger.info('Deleted snapshot metadata', { count: snapshots.length });
 
     // 4. Delete R2 files
     logger.info('Deleting R2 files');
-    await env.SNAPSHOTS.delete(`${SNAPSHOT_KEY_PREFIX}latest.tar.zst`);
-    await env.SNAPSHOTS.delete(`${SNAPSHOT_KEY_PREFIX}metadata.json`);
+    await env.SNAPSHOTS.delete(SNAPSHOT_OBJECT_KEY);
 
     logger.info('Snapshot and sandbox state reset complete');
     return Response.json({
       success: true,
       message: 'Snapshot deleted and sandbox reset',
-      deletedMetadata: snapshots.length
+      deletedMetadata: metadata ? 1 : 0
     });
   } catch (error) {
     logger.error(
@@ -1066,12 +904,12 @@ async function handleRun(env: Env): Promise<Response> {
   const startTime = Date.now();
   const logger = createSimpleLogger({
     component: 'sandbox-do',
-    sandboxId: 'volume-snapshot-demo',
+    sandboxId: SANDBOX_ID,
     operation: 'run'
   });
 
   logger.info('Running npm build');
-  const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo', {
+  const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
     debug: true
   });
 
@@ -1105,28 +943,25 @@ async function handleRun(env: Env): Promise<Response> {
 
 /**
  * POST /sleep - Force the sandbox to sleep
- * Triggers auto-snapshot if configured, then puts the sandbox to sleep.
- * Next request will wake and restore from snapshot.
+ * Next request will need to restore from snapshot manually.
  */
 async function handleSleep(env: Env): Promise<Response> {
   const logger = createSimpleLogger({
     component: 'sandbox-do',
-    sandboxId: 'volume-snapshot-demo',
+    sandboxId: SANDBOX_ID,
     operation: 'sleep'
   });
 
   logger.info('Putting sandbox to sleep');
-  const sandbox = getSandbox(env.Sandbox, 'volume-snapshot-demo', {
+  const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
     debug: true
   });
 
   try {
-    // Update state before sleeping so it's captured in the auto-snapshot
     logger.info('Reading state');
     const state = await readSandboxState(sandbox);
-    await writeSandboxState(sandbox, state, logger);
 
-    // Destroy triggers auto-snapshot if configured, then sleeps
+    // Destroy container to force sleep
     logger.info('Destroying sandbox');
     await sandbox.destroy();
 
@@ -1134,7 +969,7 @@ async function handleSleep(env: Env): Promise<Response> {
     return Response.json({
       success: true,
       message:
-        'Sandbox is now sleeping. Next request will wake and restore from snapshot.',
+        'Sandbox is now sleeping. Next request can restore the snapshot.',
       visitCount: state.visitCount
     });
   } catch (error) {
@@ -1228,7 +1063,7 @@ function getHtmlUI(): string {
   <p class="subtitle">See how snapshots restore container state in seconds instead of minutes</p>
   
   <div id="header-info" class="header-info hidden">
-    <div class="sandbox-id">Sandbox: <strong>volume-snapshot-demo</strong></div>
+    <div class="sandbox-id">Sandbox: <strong>${SANDBOX_ID}</strong></div>
     <div class="visit-info">
       <span class="visit-count" id="visit-count">Visit #1</span>
       <span id="status-badge" class="status-badge"></span>
@@ -1447,7 +1282,7 @@ function getHtmlUI(): string {
     }
     
     async function forceSleep() {
-      if (!confirm('Put sandbox to sleep? This will trigger auto-snapshot. Click "Run Setup" after to see the fast restore.')) return;
+      if (!confirm('Put sandbox to sleep? Click "Run Setup" after to restore from the snapshot.')) return;
       
       clearLog();
       setButtons(false);

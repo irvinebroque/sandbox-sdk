@@ -17,7 +17,6 @@ import type {
   Process,
   ProcessOptions,
   ProcessStatus,
-  R2CredentialConfig,
   RestoreOptions,
   RestoreResult,
   RunCodeOptions,
@@ -44,15 +43,10 @@ import {
 } from '@repo/shared';
 import {
   type CreateSnapshotRequest,
-  type CreateSnapshotResponse,
   type DownloadSpec,
   type ExecuteResponse,
-  type GetManifestRequest,
-  type GetManifestResponse,
   type RestoreSnapshotRequest,
-  type RestoreSnapshotResponse,
-  SandboxClient,
-  type SnapshotManifest
+  SandboxClient
 } from './clients';
 import type { ErrorResponse } from './errors';
 import {
@@ -79,13 +73,6 @@ import {
   S3FSMountError
 } from './storage-mount/errors';
 import type { MountInfo } from './storage-mount/types';
-import { generateCacheKey, generateLockfileCacheKey } from './utils/cache-keys';
-import { generateSignedCacheUrl } from './utils/cache-signing';
-import {
-  generatePresignedGetUrl,
-  generatePresignedPutUrl
-} from './utils/s3-presign';
-import { parseTtl } from './utils/ttl';
 import { validateSnapshotId } from './utils/validation';
 import { SDK_VERSION } from './version';
 
@@ -167,16 +154,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   private keepAliveEnabled: boolean = false;
   private activeMounts: Map<string, MountInfo> = new Map();
   private transport: 'http' | 'websocket' = 'http';
-  private autoSnapshotInProgress = false;
-  private autoRestoreInProgress = false;
   private debugEnabled: boolean = false;
-
-  /**
-   * Last restored cache key for content-addressed skip-if-restored optimization
-   * When using content-addressed keys, if the current cache key matches this value,
-   * createSnapshot() can skip the upload since the content is unchanged.
-   */
-  private lastRestoredCacheKey: string | null = null;
 
   /**
    * Default container startup timeouts (conservative for production)
@@ -273,8 +251,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         (await this.ctx.storage.get<string>('defaultSession')) || null;
       this.keepAliveEnabled =
         (await this.ctx.storage.get<boolean>('keepAliveEnabled')) || false;
-      this.lastRestoredCacheKey =
-        (await this.ctx.storage.get<string>('lastRestoredCacheKey')) || null;
 
       // Load saved timeout configuration (highest priority)
       const storedTimeouts =
@@ -814,30 +790,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         error instanceof Error ? error : new Error(String(error))
       );
     });
-
-    // Auto-restore snapshot on wake if enabled
-    // Non-blocking: requests may arrive before restore completes, but this is
-    // preferable to blocking all requests if restore is slow or hangs.
-    // The autoRestoreInProgress flag allows callers to check restore status if needed.
-    if (!this.autoRestoreInProgress) {
-      this.autoRestoreInProgress = true;
-      this.logger.debug('Starting auto-restore check');
-
-      this.maybeAutoRestore()
-        .then(() => {
-          this.logger.debug('Auto-restore check completed');
-        })
-        .catch((error) => {
-          this.logger.error(
-            'Auto-restore failed on wake',
-            error instanceof Error ? error : new Error(String(error))
-          );
-          // Don't re-throw - allow container to continue even if restore fails
-        })
-        .finally(() => {
-          this.autoRestoreInProgress = false;
-        });
-    }
   }
 
   /**
@@ -1123,7 +1075,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
   /**
    * Override onActivityExpired to prevent automatic shutdown when keepAlive is enabled
-   * When keepAlive is disabled, creates auto-snapshot if configured, then stops container
+   * When keepAlive is disabled, stops container
    */
   override async onActivityExpired(): Promise<void> {
     if (this.keepAliveEnabled) {
@@ -1132,9 +1084,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       );
       // Do nothing - don't call stop(), container stays alive
     } else {
-      // Auto-snapshot before sleep if configured
-      await this.maybeAutoSnapshotWithRetry();
-
       // Default behavior: stop the container
       this.logger.debug('Activity expired - stopping container');
       await super.onActivityExpired();
@@ -2750,16 +2699,18 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       throw new Error('volumePath is required in snapshot configuration');
     }
 
-    if (config.maxSnapshots !== undefined && config.maxSnapshots < 1) {
-      throw new Error('maxSnapshots must be at least 1');
-    }
+    const normalized: SnapshotConfig = {
+      ...config,
+      compressionLevel: config.compressionLevel || 'balanced',
+      excludePatterns: config.excludePatterns || []
+    };
 
     // Store in DO storage
-    await this.ctx.storage.put('snapshot:config', config);
+    await this.ctx.storage.put('snapshot:config', normalized);
 
     this.logger.info('Snapshot configuration saved', {
-      volumePath: config.volumePath,
-      enabled: config.enabled
+      volumePath: normalized.volumePath,
+      enabled: normalized.enabled
     });
   }
 
@@ -2774,73 +2725,9 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     );
   }
 
-  /**
-   * Configure R2 credentials for auto-snapshot and auto-restore functionality
-   *
-   * Credentials are stored separately from snapshot config for security and are
-   * never exposed via getSnapshotConfig(). Required when using autoSnapshotOnSleep
-   * or autoRestoreOnWake features.
-   *
-   * @param config - R2 credential configuration
-   *
-   * @example
-   * ```typescript
-   * await sandbox.configureR2Credentials({
-   *   accountId: env.R2_ACCOUNT_ID,
-   *   bucketName: env.R2_BUCKET_NAME,
-   *   accessKeyId: env.R2_ACCESS_KEY_ID,
-   *   secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-   *   keyPrefix: 'snapshots/'
-   * });
-   * ```
-   */
-  async configureR2Credentials(config: R2CredentialConfig): Promise<void> {
-    // Validate required fields
-    if (!config.accountId) {
-      throw new Error('accountId is required in R2 credential configuration');
-    }
-    if (!config.bucketName) {
-      throw new Error('bucketName is required in R2 credential configuration');
-    }
-    if (!config.accessKeyId) {
-      throw new Error('accessKeyId is required in R2 credential configuration');
-    }
-    if (!config.secretAccessKey) {
-      throw new Error(
-        'secretAccessKey is required in R2 credential configuration'
-      );
-    }
-
-    // Store in DO storage (separate from snapshot config)
-    await this.ctx.storage.put('r2:credentials', config);
-
-    this.logger.info('R2 credentials configured', {
-      accountId: config.accountId,
-      bucketName: config.bucketName,
-      keyPrefix: config.keyPrefix
-    });
-  }
-
-  /**
-   * Clear stored R2 credentials
-   *
-   * Removes the R2 credential configuration. Auto-snapshot and auto-restore
-   * features will no longer work after this call unless CDN cache is configured.
-   */
-  async clearR2Credentials(): Promise<void> {
-    await this.ctx.storage.delete('r2:credentials');
-    this.logger.info('R2 credentials cleared');
-  }
-
-  /**
-   * Check if R2 credentials are configured
-   *
-   * @returns true if R2 credentials are available for auto-snapshot/restore
-   */
-  async hasR2Credentials(): Promise<boolean> {
-    const creds =
-      await this.ctx.storage.get<R2CredentialConfig>('r2:credentials');
-    return creds != null;
+  private getLatestSnapshotKey(): string {
+    const sandboxId = this.sandboxName || this.ctx.id.toString();
+    return `snapshots/${sandboxId}/latest.tar.zst`;
   }
 
   /**
@@ -2853,7 +2740,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   async createSnapshot(
     uploadUrl: string,
     options?: CreateSnapshotOptions
-  ): Promise<SnapshotMetadata | null> {
+  ): Promise<SnapshotMetadata> {
     const config = await this.getSnapshotConfig();
     if (!config) {
       throw new Error(
@@ -2865,26 +2752,11 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       throw new Error('Snapshots are disabled in configuration');
     }
 
-    // Content-addressed skip-if-restored optimization
-    // If we're using content-addressed keys and the current cache key matches
-    // what was last restored, skip the upload since content is unchanged
-    let currentCacheKey: string | null = null;
-    if (config.useContentAddressedKeys) {
-      currentCacheKey = await this.computeContentAddressedKey(config);
-      if (currentCacheKey && currentCacheKey === this.lastRestoredCacheKey) {
-        this.logger.info(
-          'Skipping snapshot upload - content unchanged from last restore',
-          {
-            cacheKey: currentCacheKey
-          }
-        );
-        // Return null to indicate snapshot was skipped (caller should check)
-        return null;
-      }
-    }
-
-    const snapshotId = options?.snapshotId || `snap-${Date.now()}`;
+    const snapshotId = options?.snapshotId || 'latest';
     validateSnapshotId(snapshotId);
+    if (snapshotId !== 'latest') {
+      throw new Error('Only snapshotId "latest" is supported');
+    }
 
     // Map compression level to numeric value
     const compressionLevel =
@@ -2910,46 +2782,21 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     }
 
     // Build metadata
+    const r2Key = this.getLatestSnapshotKey();
     const metadata: SnapshotMetadata = {
       id: snapshotId,
       sandboxId: this.sandboxName || this.ctx.id.toString(),
       volumePath: config.volumePath,
       createdAt: Date.now(),
-      r2Key: `snapshots/${this.sandboxName || this.ctx.id.toString()}/${snapshotId}.tar.zst`,
+      r2Key,
       sizeBytes: response.stats?.compressedBytes || 0,
-      uncompressedBytes: response.stats?.totalBytes || 0,
-      fileCount: response.stats?.totalFiles || 0,
-      contentHash: response.contentHash || '',
-      isIncremental: false,
+      fileCount: 0,
       restoreCount: 0,
       tags: options?.tags || {}
     };
 
-    // Compute expiresAt from TTL (per-snapshot TTL takes precedence over config default)
-    const ttlString = options?.ttl ?? config.defaultTtl;
-    if (ttlString) {
-      const ttlMs = parseTtl(ttlString);
-      if (ttlMs !== null) {
-        metadata.expiresAt = Date.now() + ttlMs;
-      }
-    }
-
     // Store metadata (atomic - no separate list to maintain)
     await this.ctx.storage.put(`snapshot:meta:${snapshotId}`, metadata);
-
-    // Cleanup old snapshots if over limit
-    if (config.maxSnapshots) {
-      const snapshots = await this.listSnapshots();
-      if (snapshots.length > config.maxSnapshots) {
-        const toDelete = snapshots
-          .sort((a, b) => a.createdAt - b.createdAt)
-          .slice(0, snapshots.length - config.maxSnapshots);
-
-        for (const old of toDelete) {
-          await this.deleteSnapshotMetadata(old.id);
-        }
-      }
-    }
 
     this.logger.info('Snapshot created', {
       snapshotId,
@@ -2958,83 +2805,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     });
 
     return metadata;
-  }
-
-  /**
-   * Compute content-addressed cache key from lockfile
-   *
-   * @param config - Snapshot configuration
-   * @returns Cache key hash or null if unable to compute
-   */
-  private async computeContentAddressedKey(
-    config: SnapshotConfig
-  ): Promise<string | null> {
-    try {
-      // Use explicit lockfile path if configured
-      if (config.lockfilePath) {
-        // Use session-free lockfile read to avoid lock contention
-        const result = await this.client.snapshots.readLockfile(
-          config.lockfilePath
-        );
-        if (result.success && result.content && result.content.trim().length) {
-          return generateCacheKey(result.content);
-        }
-        return null;
-      }
-
-      // Auto-detect lockfile in volume path using session-free reads
-      const lockfileResult = await this.detectLockfileSessionFree(
-        config.volumePath
-      );
-      if (lockfileResult) {
-        this.logger.debug('Auto-detected lockfile for cache key', {
-          lockfilePath: lockfileResult.lockfilePath
-        });
-        return lockfileResult.cacheKey;
-      }
-
-      return null;
-    } catch (error) {
-      this.logger.debug('Failed to compute content-addressed key', {
-        error: error instanceof Error ? error.message : String(error)
-      });
-      return null;
-    }
-  }
-
-  /**
-   * Detect lockfile using session-free reads to avoid lock contention.
-   * Tries common lockfile paths in priority order.
-   */
-  private async detectLockfileSessionFree(
-    cwd: string
-  ): Promise<{ cacheKey: string; lockfilePath: string } | null> {
-    const lockfiles = [
-      'package-lock.json',
-      'pnpm-lock.yaml',
-      'yarn.lock',
-      'bun.lock',
-      'bun.lockb'
-    ];
-
-    for (const lockfile of lockfiles) {
-      const path = cwd.endsWith('/')
-        ? `${cwd}${lockfile}`
-        : `${cwd}/${lockfile}`;
-
-      try {
-        const result = await this.client.snapshots.readLockfile(path);
-
-        if (result.success && result.content && result.content.trim().length) {
-          const cacheKey = await generateCacheKey(result.content);
-          return { cacheKey, lockfilePath: path };
-        }
-      } catch {
-        // Lockfile doesn't exist or can't be read - continue to next type
-      }
-    }
-
-    return null;
   }
 
   /**
@@ -3075,8 +2845,11 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       throw new Error('Snapshots are disabled in configuration');
     }
 
-    const snapshotId = options?.snapshotId || `snap-${Date.now()}`;
+    const snapshotId = options?.snapshotId || 'latest';
     validateSnapshotId(snapshotId);
+    if (snapshotId !== 'latest') {
+      throw new Error('Only snapshotId "latest" is supported');
+    }
 
     // Map compression level to numeric value
     const compressionLevel =
@@ -3100,32 +2873,28 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     const encoder = new TextEncoder();
 
     // Capture DO context for use in stream callbacks
-    const self = this;
     const logger = this.logger;
     const sandboxName = this.sandboxName;
     const ctxId = this.ctx.id.toString();
     const ctxStorage = this.ctx.storage;
     const tags = options?.tags || {};
-    const ttlString = options?.ttl ?? config.defaultTtl;
     const volumePath = config.volumePath;
-    const maxSnapshots = config.maxSnapshots;
+    const r2Key = this.getLatestSnapshotKey();
 
     // Track final stats for metadata
     let finalStats: SnapshotProgressEvent['stats'] | undefined;
-    let contentHash: string | undefined;
 
     // Return a ReadableStream that wraps the container's SSE stream
     // This handles DO-side logic (metadata storage) while re-emitting events
     return new ReadableStream<Uint8Array>({
       async start(controller) {
         try {
-          for await (const event of parseSSEStream<
-            SnapshotProgressEvent & { contentHash?: string }
-          >(containerStream)) {
+          for await (const event of parseSSEStream<SnapshotProgressEvent>(
+            containerStream
+          )) {
             // Capture final stats from complete event
             if (event.type === 'complete' && event.stats) {
               finalStats = event.stats;
-              contentHash = event.contentHash;
 
               // Build metadata from captured stats
               const metadata: SnapshotMetadata = {
@@ -3133,40 +2902,15 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
                 sandboxId: sandboxName || ctxId,
                 volumePath,
                 createdAt: Date.now(),
-                r2Key: `snapshots/${sandboxName || ctxId}/${snapshotId}.tar.zst`,
+                r2Key,
                 sizeBytes: finalStats?.compressedBytes || 0,
-                uncompressedBytes: finalStats?.totalBytes || 0,
-                fileCount: finalStats?.totalFiles || 0,
-                contentHash: contentHash || '',
-                isIncremental: false,
+                fileCount: 0,
                 restoreCount: 0,
                 tags
               };
 
-              // Compute expiresAt from TTL
-              if (ttlString) {
-                const ttlMs = parseTtl(ttlString);
-                if (ttlMs !== null) {
-                  metadata.expiresAt = Date.now() + ttlMs;
-                }
-              }
-
               // Store metadata (atomic - no separate list to maintain)
               await ctxStorage.put(`snapshot:meta:${snapshotId}`, metadata);
-
-              // Cleanup old snapshots if over limit
-              if (maxSnapshots) {
-                const snapshots = await self.listSnapshots();
-                if (snapshots.length > maxSnapshots) {
-                  const toDelete = snapshots
-                    .sort((a, b) => a.createdAt - b.createdAt)
-                    .slice(0, snapshots.length - maxSnapshots);
-
-                  for (const old of toDelete) {
-                    await self.deleteSnapshotMetadata(old.id);
-                  }
-                }
-              }
 
               logger.info('Snapshot created (streaming)', {
                 snapshotId,
@@ -3234,33 +2978,22 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     let metadata: SnapshotMetadata | undefined;
     if (snapshotId) {
       validateSnapshotId(snapshotId);
-      metadata = await this.ctx.storage.get<SnapshotMetadata>(
-        `snapshot:meta:${snapshotId}`
-      );
-    } else {
-      // Get latest snapshot
-      const snapshots = await this.listSnapshots();
-      if (snapshots.length === 0) {
-        throw new Error('No snapshots available to restore');
+      if (snapshotId !== 'latest') {
+        throw new Error('Only snapshotId "latest" is supported');
       }
-      metadata = snapshots.sort((a, b) => b.createdAt - a.createdAt)[0];
     }
+    metadata = await this.ctx.storage.get<SnapshotMetadata>(
+      `snapshot:meta:${snapshotId || 'latest'}`
+    );
 
     if (!metadata) {
-      throw new Error(`Snapshot not found: ${snapshotId}`);
+      throw new Error('Snapshot not found: latest');
     }
 
     // Build download spec
     const downloadSpec: DownloadSpec = {
       snapshotId: metadata.id,
-      url: downloadUrl,
-      manifest: {
-        version: 1,
-        snapshotId: metadata.id,
-        files: [],
-        deletedPaths: []
-      },
-      expectedHash: metadata.contentHash
+      url: downloadUrl
     };
 
     // Call container to restore
@@ -3281,16 +3014,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     metadata.restoreCount += 1;
     await this.ctx.storage.put(`snapshot:meta:${metadata.id}`, metadata);
 
-    // Track last restored cache key for skip-if-restored optimization
-    if (config.useContentAddressedKeys) {
-      const cacheKey = await this.computeContentAddressedKey(config);
-      if (cacheKey) {
-        this.lastRestoredCacheKey = cacheKey;
-        await this.ctx.storage.put('lastRestoredCacheKey', cacheKey);
-        this.logger.debug('Tracked last restored cache key', { cacheKey });
-      }
-    }
-
     this.logger.info('Snapshot restored', {
       snapshotId: metadata.id,
       filesRestored: response.stats?.filesRestored || 0
@@ -3309,223 +3032,17 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   }
 
   /**
-   * Restore a snapshot using the CDN cache
-   *
-   * Convenience method that generates a signed cache URL internally.
-   * Requires cacheCustomDomain and HMAC secret to be configured.
-   *
-   * The HMAC secret is resolved in this order:
-   * 1. options.hmacSecret (per-request override)
-   * 2. SNAPSHOT_CACHE_HMAC_SECRET environment variable
-   * 3. config.cacheHmacSecret (config fallback)
-   *
-   * @param snapshotId - Optional specific snapshot ID (uses latest if not specified)
-   * @param options - Optional restore options
-   * @returns Restore result
-   * @throws Error if cache is not configured or HMAC secret is not available
-   */
-  async restoreSnapshotFromCache(
-    snapshotId?: string,
-    options?: RestoreOptions
-  ): Promise<RestoreResult> {
-    const config = await this.getSnapshotConfig();
-    if (!config) {
-      throw new Error(
-        'Snapshots not configured. Call configureSnapshots() first.'
-      );
-    }
-
-    // Get snapshot metadata
-    let metadata: SnapshotMetadata | undefined;
-    if (snapshotId) {
-      validateSnapshotId(snapshotId);
-      metadata = await this.ctx.storage.get<SnapshotMetadata>(
-        `snapshot:meta:${snapshotId}`
-      );
-    } else {
-      // Get latest snapshot
-      const snapshots = await this.listSnapshots();
-      if (snapshots.length === 0) {
-        throw new Error('No snapshots available to restore');
-      }
-      metadata = snapshots.sort((a, b) => b.createdAt - a.createdAt)[0];
-    }
-
-    if (!metadata) {
-      throw new Error(`Snapshot not found: ${snapshotId}`);
-    }
-
-    // Check if we should bypass cache
-    if (options?.bypassCache) {
-      throw new Error(
-        'bypassCache is set but restoreSnapshotFromCache requires cache. ' +
-          'Use restoreSnapshot(downloadUrl) with a presigned URL instead.'
-      );
-    }
-
-    // Check if cache is properly configured
-    if (!this.shouldUseCachedUrl(config, metadata, options)) {
-      throw new Error(
-        'Cache not configured. Set cacheCustomDomain in snapshot config ' +
-          'and provide HMAC secret via env var, config, or options.'
-      );
-    }
-
-    // Get HMAC secret
-    const secret = this.getCacheHmacSecret(config, options);
-    if (!secret) {
-      throw new Error(
-        'HMAC secret not available. Provide via SNAPSHOT_CACHE_HMAC_SECRET env var, ' +
-          'config.cacheHmacSecret, or options.hmacSecret.'
-      );
-    }
-
-    // Generate signed cache URL
-    const downloadUrl = await this.generateCachedDownloadUrl(
-      metadata,
-      config,
-      secret
-    );
-
-    this.logger.debug('Using cached download URL for restore', {
-      snapshotId: metadata.id,
-      domain: config.cacheCustomDomain
-    });
-
-    // Delegate to standard restore with the cached URL
-    return this.restoreSnapshot(downloadUrl, metadata.id, options);
-  }
-
-  /**
-   * Get HMAC secret with priority: options → env → config
-   */
-  private getCacheHmacSecret(
-    config: SnapshotConfig,
-    options?: RestoreOptions
-  ): string | undefined {
-    // 1. Per-request override (highest priority)
-    if (options?.hmacSecret) {
-      return options.hmacSecret;
-    }
-
-    // 2. Environment variable
-    const envObj = this.env as Record<string, unknown>;
-    const envSecret = getEnvString(envObj, 'SNAPSHOT_CACHE_HMAC_SECRET');
-    if (envSecret) {
-      return envSecret;
-    }
-
-    // 3. Config fallback (lowest priority)
-    return config.cacheHmacSecret;
-  }
-
-  /**
-   * Check if cached URL should be used for this restore
-   */
-  private shouldUseCachedUrl(
-    config: SnapshotConfig,
-    metadata: SnapshotMetadata,
-    options?: RestoreOptions
-  ): boolean {
-    // Cache disabled if no custom domain configured
-    if (!config.cacheCustomDomain) {
-      return false;
-    }
-
-    // Check if bypass is requested
-    if (options?.bypassCache) {
-      return false;
-    }
-
-    // Check size limit (default 512 MB)
-    const sizeLimit = config.cacheSizeLimit ?? 536870912;
-    if (metadata.sizeBytes > sizeLimit) {
-      this.logger.debug('Snapshot exceeds cache size limit', {
-        snapshotId: metadata.id,
-        sizeBytes: metadata.sizeBytes,
-        limit: sizeLimit
-      });
-      return false;
-    }
-
-    // Check if HMAC secret is available
-    const secret = this.getCacheHmacSecret(config, options);
-    if (!secret) {
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * Generate a signed URL for downloading a snapshot via cache
-   */
-  private async generateCachedDownloadUrl(
-    metadata: SnapshotMetadata,
-    config: SnapshotConfig,
-    secret: string
-  ): Promise<string> {
-    if (!config.cacheCustomDomain) {
-      throw new Error('cacheCustomDomain is required for cached downloads');
-    }
-
-    // TTL defaults to 1 hour
-    const ttlSeconds = config.cacheUrlTtl ?? 3600;
-
-    // Build path from R2 key
-    // R2 key format: snapshots/{sandboxId}/{snapshotId}.tar.zst
-    const path = `/${metadata.r2Key}`;
-
-    return generateSignedCacheUrl(
-      config.cacheCustomDomain,
-      path,
-      secret,
-      ttlSeconds
-    );
-  }
-
-  /**
    * List all snapshots for this sandbox
    *
-   * Filters out expired snapshots and performs lazy cleanup of their metadata.
-   * R2 object deletion is handled by R2 lifecycle rules, not here.
+   * Simplified model returns at most one snapshot ("latest").
    *
-   * @returns Array of snapshot metadata (excluding expired snapshots)
+   * @returns Array with latest snapshot metadata, or empty if none
    */
   async listSnapshots(): Promise<SnapshotMetadata[]> {
-    // Use storage.list() with prefix to atomically get all snapshot keys
-    // This avoids race conditions from maintaining a separate list
-    const entries = await this.ctx.storage.list<SnapshotMetadata>({
-      prefix: 'snapshot:meta:'
-    });
-
-    const now = Date.now();
-    const snapshots: SnapshotMetadata[] = [];
-    const expiredIds: string[] = [];
-
-    for (const [, metadata] of entries) {
-      if (metadata) {
-        // Check if snapshot has expired
-        if (metadata.expiresAt && metadata.expiresAt < now) {
-          expiredIds.push(metadata.id);
-        } else {
-          snapshots.push(metadata);
-        }
-      }
-    }
-
-    // Cleanup expired snapshots (metadata only - R2 lifecycle rules handle object deletion)
-    if (expiredIds.length > 0) {
-      for (const id of expiredIds) {
-        await this.deleteSnapshotMetadata(id);
-      }
-      this.logger.info('Cleaned up expired snapshots', {
-        count: expiredIds.length,
-        ids: expiredIds
-      });
-    }
-
-    return snapshots;
+    const metadata = await this.ctx.storage.get<SnapshotMetadata>(
+      'snapshot:meta:latest'
+    );
+    return metadata ? [metadata] : [];
   }
 
   /**
@@ -3535,6 +3052,9 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
    */
   async deleteSnapshotMetadata(snapshotId: string): Promise<void> {
     validateSnapshotId(snapshotId);
+    if (snapshotId !== 'latest') {
+      throw new Error('Only snapshotId "latest" is supported');
+    }
     // Simply delete the metadata key - no separate list to maintain
     await this.ctx.storage.delete(`snapshot:meta:${snapshotId}`);
     this.logger.info('Snapshot metadata deleted', { snapshotId });
@@ -3558,196 +3078,14 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     snapshotId: string
   ): Promise<SnapshotMetadata | null> {
     validateSnapshotId(snapshotId);
+    if (snapshotId !== 'latest') {
+      throw new Error('Only snapshotId "latest" is supported');
+    }
     return (
       (await this.ctx.storage.get<SnapshotMetadata>(
         `snapshot:meta:${snapshotId}`
       )) || null
     );
-  }
-
-  /**
-   * Get the current filesystem manifest for the configured volume
-   *
-   * @returns Manifest with file list
-   */
-  async getVolumeManifest(): Promise<GetManifestResponse> {
-    const config = await this.getSnapshotConfig();
-    if (!config) {
-      throw new Error(
-        'Snapshots not configured. Call configureSnapshots() first.'
-      );
-    }
-
-    const request: GetManifestRequest = {
-      volumePath: config.volumePath,
-      excludePatterns: config.excludePatterns || []
-    };
-
-    return this.client.snapshots.getManifest(request);
-  }
-
-  // ============================================================================
-  // Private Auto-Snapshot/Restore Methods
-  // ============================================================================
-
-  /**
-   * Get stored R2 credentials (private - never expose to callers)
-   */
-  private async getR2Credentials(): Promise<R2CredentialConfig | null> {
-    return (
-      (await this.ctx.storage.get<R2CredentialConfig>('r2:credentials')) || null
-    );
-  }
-
-  /**
-   * Generate R2 object key for a snapshot
-   */
-  private generateR2Key(creds: R2CredentialConfig, snapshotId: string): string {
-    const prefix = creds.keyPrefix || 'snapshots/';
-    const normalizedPrefix = prefix.endsWith('/') ? prefix : `${prefix}/`;
-    return `${normalizedPrefix}${this.ctx.id}/${snapshotId}.tar.zst`;
-  }
-
-  /**
-   * Auto-restore snapshot on container wake if enabled
-   *
-   * Called from onStart(). Errors are caught and logged by the caller
-   * to avoid blocking container startup.
-   */
-  private async maybeAutoRestore(): Promise<void> {
-    const AUTO_RESTORE_TIMEOUT_MS = 90_000;
-
-    const config = await this.getSnapshotConfig();
-    if (!config?.enabled || !config.autoRestoreOnWake) {
-      return;
-    }
-
-    // Get latest snapshot
-    const snapshots = await this.listSnapshots();
-    if (snapshots.length === 0) {
-      this.logger.debug('No snapshots available for auto-restore');
-      return;
-    }
-
-    const latest = snapshots.sort((a, b) => b.createdAt - a.createdAt)[0];
-    this.logger.info('Auto-restoring snapshot on wake', {
-      snapshotId: latest.id
-    });
-
-    // Wrap restore operation in a timeout to avoid blocking container startup
-    const restorePromise = (async () => {
-      // Prefer CDN cache if configured, otherwise use R2 presigned URL
-      if (this.shouldUseCachedUrl(config, latest)) {
-        await this.restoreSnapshotFromCache(latest.id);
-      } else {
-        const creds = await this.getR2Credentials();
-        if (!creds) {
-          this.logger.warn(
-            'Auto-restore enabled but no R2 credentials or CDN cache configured'
-          );
-          return;
-        }
-
-        const downloadUrl = await generatePresignedGetUrl(creds, latest.r2Key);
-        await this.restoreSnapshot(downloadUrl, latest.id);
-      }
-    })();
-
-    const timeoutPromise = new Promise<'timeout'>((resolve) =>
-      setTimeout(() => resolve('timeout'), AUTO_RESTORE_TIMEOUT_MS)
-    );
-
-    const result = await Promise.race([restorePromise, timeoutPromise]);
-
-    if (result === 'timeout') {
-      this.logger.warn('Auto-restore timed out, continuing without restore', {
-        snapshotId: latest.id,
-        timeoutMs: AUTO_RESTORE_TIMEOUT_MS
-      });
-      return;
-    }
-
-    this.logger.info('Auto-restore completed', { snapshotId: latest.id });
-  }
-
-  /**
-   * Auto-snapshot before container sleep with retry logic
-   *
-   * Called from onActivityExpired(). Retries once on failure, then
-   * proceeds with shutdown regardless to avoid stuck containers.
-   */
-  private async maybeAutoSnapshotWithRetry(): Promise<void> {
-    if (this.autoSnapshotInProgress) {
-      this.logger.debug('Auto-snapshot already in progress, skipping');
-      return;
-    }
-    this.autoSnapshotInProgress = true;
-    try {
-      const config = await this.getSnapshotConfig();
-      if (!config?.enabled || !config.autoSnapshotOnSleep) {
-        return;
-      }
-
-      const creds = await this.getR2Credentials();
-      if (!creds) {
-        this.logger.warn(
-          'Auto-snapshot enabled but no R2 credentials configured - skipping'
-        );
-        return;
-      }
-
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          await this.performAutoSnapshot(config, creds);
-          return; // Success
-        } catch (error) {
-          const errorObj =
-            error instanceof Error ? error : new Error(String(error));
-          if (attempt === 1) {
-            this.logger.warn('Auto-snapshot attempt 1 failed, retrying', {
-              error: errorObj.message
-            });
-          } else {
-            this.logger.error(
-              'Auto-snapshot failed after retry, proceeding with shutdown',
-              errorObj
-            );
-          }
-        }
-      }
-    } finally {
-      this.autoSnapshotInProgress = false;
-    }
-  }
-
-  /**
-   * Perform the actual auto-snapshot operation
-   */
-  private async performAutoSnapshot(
-    config: SnapshotConfig,
-    creds: R2CredentialConfig
-  ): Promise<void> {
-    const snapshotId = `auto-${Date.now()}`;
-    const r2Key = this.generateR2Key(creds, snapshotId);
-
-    this.logger.info('Creating auto-snapshot before sleep', {
-      snapshotId,
-      r2Key
-    });
-
-    const uploadUrl = await generatePresignedPutUrl(creds, r2Key);
-    const result = await this.createSnapshot(uploadUrl, { snapshotId });
-
-    if (result) {
-      this.logger.info('Auto-snapshot created successfully', {
-        snapshotId: result.id,
-        sizeBytes: result.sizeBytes
-      });
-    } else {
-      this.logger.debug(
-        'Auto-snapshot skipped (content unchanged from last restore)'
-      );
-    }
   }
 }
 
@@ -3757,7 +3095,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
 export type {
   CreateSnapshotOptions,
-  R2CredentialConfig,
   RestoreOptions,
   RestoreResult,
   SnapshotConfig,

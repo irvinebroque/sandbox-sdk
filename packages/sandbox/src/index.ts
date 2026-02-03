@@ -141,18 +141,6 @@ export {
   MissingCredentialsError,
   S3FSMountError
 } from './storage-mount/errors';
-// Export content-addressed cache key utilities
-export {
-  generateCacheKey,
-  generateLockfileCacheKey,
-  generatePrefixedCacheKey
-} from './utils/cache-keys';
-// Export cache signing utilities for snapshot CDN caching
-export {
-  generateSignedCacheUrl,
-  isSignedUrlExpired,
-  parseSignedCacheUrl
-} from './utils/cache-signing';
 // Export presigned URL generation for R2 (no AWS SDK required)
 export {
   generatePresignedGetUrl,

@@ -44,12 +44,8 @@ export type {
   CreateSnapshotRequest,
   CreateSnapshotResponse,
   DownloadSpec,
-  FileEntry as SnapshotFileEntry,
-  GetManifestRequest,
-  GetManifestResponse,
   RestoreSnapshotRequest,
-  RestoreSnapshotResponse,
-  SnapshotManifest
+  RestoreSnapshotResponse
 } from '@repo/shared';
 // Command client types
 export type { ExecuteRequest, ExecuteResponse } from './command-client';

@@ -7,8 +7,6 @@
 import type {
   CreateSnapshotRequest,
   CreateSnapshotResponse,
-  GetManifestRequest,
-  GetManifestResponse,
   RestoreSnapshotRequest,
   RestoreSnapshotResponse
 } from '@repo/shared';
@@ -22,7 +20,7 @@ export class SnapshotClient extends BaseHttpClient {
    * Create a snapshot and upload to R2
    *
    * @param request - Snapshot creation parameters
-   * @returns Response with manifest and stats on success
+   * @returns Response with stats on success
    */
   async create(
     request: CreateSnapshotRequest
@@ -34,10 +32,7 @@ export class SnapshotClient extends BaseHttpClient {
       );
 
       if (response.success) {
-        this.logSuccess(
-          'Snapshot created',
-          `${request.snapshotId} (${response.stats?.totalFiles || 0} files)`
-        );
+        this.logSuccess('Snapshot created', request.snapshotId);
       }
 
       return response;
@@ -96,57 +91,6 @@ export class SnapshotClient extends BaseHttpClient {
       return response;
     } catch (error) {
       this.logError('restoreSnapshot', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Get filesystem manifest for a volume path
-   *
-   * @param request - Manifest request parameters
-   * @returns Response with file list on success
-   */
-  async getManifest(request: GetManifestRequest): Promise<GetManifestResponse> {
-    try {
-      const response = await this.post<GetManifestResponse>(
-        '/api/snapshot/manifest',
-        request
-      );
-
-      if (response.success) {
-        this.logSuccess(
-          'Manifest retrieved',
-          `${request.volumePath} (${response.fileCount || 0} files)`
-        );
-      }
-
-      return response;
-    } catch (error) {
-      this.logError('getManifest', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Read a lockfile directly without session locking.
-   * Used for content-addressed cache key computation.
-   * This bypasses the session system to avoid lock contention.
-   *
-   * @param path - Path to the lockfile
-   * @returns Response with file content or null if not found
-   */
-  async readLockfile(
-    path: string
-  ): Promise<{ success: boolean; content: string | null }> {
-    try {
-      const response = await this.post<{
-        success: boolean;
-        content: string | null;
-      }>('/api/snapshot/lockfile', { path });
-
-      return response;
-    } catch (error) {
-      this.logError('readLockfile', error);
       throw error;
     }
   }

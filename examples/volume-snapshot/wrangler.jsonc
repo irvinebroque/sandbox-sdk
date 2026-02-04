@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "account_id": "d0993424a8581ca2137e799fe64cc492",
+  "account_id": "70c8d67d39eb821aa36dd13bbe5861b6",
   "name": "sandbox-volume-snapshot-example",
   "main": "src/index.ts",
   "compatibility_date": "2025-05-06",

@@ -331,9 +331,7 @@ async function writeSandboxState(
     jsonSize: json.length
   });
   await withPeriodicLogging(
-    sandbox.exec(`cat > ${STATE_FILE} << 'EOFSTATE'\n${json}\nEOFSTATE`, {
-      timeout: 5000
-    }),
+    sandbox.writeFile(STATE_FILE, `${json}\n`),
     'state file write',
     logger
   );
@@ -548,38 +546,60 @@ function handleSetup(env: Env): Response {
       logger.info('Generating upload URL');
       const uploadUrl = await getUploadUrl(env, r2Key);
 
-      // Use streaming API for real-time progress updates
+      // Use streaming API for real-time progress updates (fallback for old containers)
       let snapshotStats: {
         compressedBytes?: number;
       } = {};
 
-      logger.info('Starting snapshot stream');
-      const snapshotStream = await withPeriodicLogging(
-        sandbox.createSnapshotStream(uploadUrl),
-        'createSnapshotStream',
-        logger
-      );
-      logger.info('Snapshot stream created, processing events...');
-      for await (const event of withStreamLogging(
-        parseSSEStream<SnapshotProgressEvent>(snapshotStream),
-        'snapshot creation',
-        logger
-      )) {
-        // Forward progress events to the client
-        logger.info(`[${event.phase}] ${event.message}`);
+      try {
+        logger.info('Starting snapshot stream');
+        const snapshotStream = await withPeriodicLogging(
+          sandbox.createSnapshotStream(uploadUrl),
+          'createSnapshotStream',
+          logger
+        );
+        logger.info('Snapshot stream created, processing events...');
+        for await (const event of withStreamLogging(
+          parseSSEStream<SnapshotProgressEvent>(snapshotStream),
+          'snapshot creation',
+          logger
+        )) {
+          // Forward progress events to the client
+          logger.info(`[${event.phase}] ${event.message}`);
 
-        if (event.type === 'error') {
-          const error = new Error(`Snapshot creation failed: ${event.error}`);
-          logger.error('Snapshot creation failed', error);
-          throw error;
+          if (event.type === 'error') {
+            const error = new Error(`Snapshot creation failed: ${event.error}`);
+            logger.error('Snapshot creation failed', error);
+            throw error;
+          }
+
+          // Capture final stats
+          if (event.stats) {
+            snapshotStats = {
+              compressedBytes:
+                event.stats.compressedBytes ?? snapshotStats.compressedBytes
+            };
+          }
         }
-
-        // Capture final stats
-        if (event.stats) {
+      } catch (error) {
+        const httpStatus =
+          error && typeof error === 'object' && 'httpStatus' in error
+            ? (error as { httpStatus?: number }).httpStatus
+            : undefined;
+        if (httpStatus === 404) {
+          logger.warn(
+            'Snapshot streaming endpoint not found. Falling back to non-streaming createSnapshot.'
+          );
+          const metadata = await withPeriodicLogging(
+            sandbox.createSnapshot(uploadUrl),
+            'createSnapshot',
+            logger
+          );
           snapshotStats = {
-            compressedBytes:
-              event.stats.compressedBytes ?? snapshotStats.compressedBytes
+            compressedBytes: metadata.sizeBytes
           };
+        } else {
+          throw error;
         }
       }
 
@@ -681,6 +701,37 @@ async function handleStatus(env: Env): Promise<Response> {
     );
     const message = error instanceof Error ? error.message : String(error);
     return Response.json({ error: message }, { status: 500 });
+  }
+}
+
+/**
+ * GET /api/version - Get container version (if supported by the image)
+ */
+async function handleApiVersion(env: Env): Promise<Response> {
+  const logger = createSimpleLogger({
+    component: 'sandbox-do',
+    sandboxId: SANDBOX_ID,
+    operation: 'version'
+  });
+  const sandbox = getSandbox(env.Sandbox, SANDBOX_ID, {
+    debug: true
+  });
+
+  try {
+    const version = await sandbox.client.utils.getVersion();
+    return new Response(JSON.stringify({ version }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error(
+      'Version check failed',
+      error instanceof Error ? error : undefined
+    );
+    return new Response(JSON.stringify({ error: message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 
@@ -1234,6 +1285,7 @@ function getHtmlUI(): string {
       clearLog();
       setButtons(false);
       appendLog('Starting setup...');
+      let setupCompleted = false;
       
       const start = performance.now();
       const eventSource = new EventSource('/setup');
@@ -1261,25 +1313,27 @@ function getHtmlUI(): string {
             timing.className = 'timing restored';
           } else {
             appendLog('Fresh setup complete, snapshot created', 'success');
-            timing.textContent = formatTime(clientTime) + ' (fresh setup)';
-            timing.className = 'timing fresh';
-          }
-          timing.classList.remove('hidden');
-          eventSource.close();
-          setButtons(true);
-        } else if (data.type === 'error') {
-          appendLog('Error: ' + data.message, 'error');
-          eventSource.close();
-          setButtons(true);
+          timing.textContent = formatTime(clientTime) + ' (fresh setup)';
+          timing.className = 'timing fresh';
         }
-      };
-      
-      eventSource.onerror = () => {
-        appendLog('Connection lost', 'error');
+        timing.classList.remove('hidden');
+        setupCompleted = true;
         eventSource.close();
         setButtons(true);
-      };
-    }
+      } else if (data.type === 'error') {
+        appendLog('Error: ' + data.message, 'error');
+        eventSource.close();
+        setButtons(true);
+      }
+    };
+    
+    eventSource.onerror = () => {
+      if (setupCompleted) return;
+      appendLog('Connection lost', 'error');
+      eventSource.close();
+      setButtons(true);
+    };
+  }
     
     async function forceSleep() {
       if (!confirm('Put sandbox to sleep? Click "Run Setup" after to restore from the snapshot.')) return;
@@ -1500,6 +1554,10 @@ export default {
 
       case '/sleep':
         if (request.method === 'POST') return handleSleep(env);
+        break;
+
+      case '/api/version':
+        if (request.method === 'GET') return handleApiVersion(env);
         break;
     }
 
